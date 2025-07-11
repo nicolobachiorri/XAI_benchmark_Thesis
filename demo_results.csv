@@ -1,0 +1,11 @@
+model,explainer,example_id,HA,R,Cn,Ct,CWS
+huawei-noah/TinyBERT_General_4L_312D,ixg,19923,0.0,1.0,0.9999999999999998,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,ixg,18453,0.0,1.0,1.0,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,ixg,12236,0.0,1.0,1.0,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,ixg,16941,0.0,1.0,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,ixg,8218,0.0,1.0,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,lime,19923,0.0,1.0,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,lime,18453,0.0,1.0,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,lime,12236,0.0,0.5035475951121018,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,lime,16941,0.0,0.8745109844156627,0.9999999999999999,inf,inf
+huawei-noah/TinyBERT_General_4L_312D,lime,8218,0.0,0.36171500002634266,0.9999999999999999,inf,inf
