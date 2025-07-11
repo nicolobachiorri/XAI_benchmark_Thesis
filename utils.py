@@ -13,13 +13,19 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def cache_save(obj, path):
-    ensure_dir(os.path.dirname(path))
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
+    try:
+        ensure_dir(os.path.dirname(path))
+        with open(path, "wb") as f:
+            pickle.dump(obj, f)
+        return True
+    except:
+        return False
 
 def cache_load(path):
-    if os.path.isfile(path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
+    try:
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    except:
+        pass
     return None
-

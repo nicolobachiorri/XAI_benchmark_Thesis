@@ -52,61 +52,92 @@ def main():
     ]
 
     rows = []
+    
     for mid in model_ids:
         print(f"\n=== MODEL {mid} ===")
-        model = load_model(mid, device=device, minimal=args.minimal)
+        
+        try:
+            model = load_model(mid, device=device, minimal=args.minimal)
+            tokenizer = AutoTokenizer.from_pretrained(mid, use_fast=True)
+            
+            # Aggiungi pad_token se mancante
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
-        if args.finetune:
-            train_ds, _ = get_imdb(tokenizer_name=mid)
-            print("  › fine-tuning testa a 2 classi …")
-            model = fine_tune_model(model, train_ds, device=device)
+            if args.finetune:
+                train_ds, _ = get_imdb(tokenizer_name=mid)
+                print("  › fine-tuning testa a 2 classi …")
+                model = fine_tune_model(model, train_ds, device=device)
 
-        tokenizer = AutoTokenizer.from_pretrained(mid, use_fast=True)
-        _, test_ds = get_imdb(tokenizer_name=mid)
-        subset = test_ds.shuffle(seed=42).select(range(args.n_examples))
+            _, test_ds = get_imdb(tokenizer_name=mid)
+            subset = test_ds.shuffle(seed=42).select(range(args.n_examples))
 
-        for e_name in expl_names:
-            explain = EXPLAINERS[e_name]
+            for e_name in expl_names:
+                if e_name not in EXPLAINERS:
+                    print(f"  Explainer {e_name} non trovato, skip")
+                    continue
+                    
+                explain = EXPLAINERS[e_name]
+                print(f"  Running {e_name}...")
 
-            for ex in tqdm.tqdm(subset, desc=e_name):
-                text = ex["text"]
+                for ex in tqdm.tqdm(subset, desc=e_name):
+                    try:
+                        text = ex["text"]
+                        if not text or len(text.strip()) < 10:
+                            continue
 
-                # attribution originale
-                orig_attr = dict(
-                    explain(model, tokenizer, text, device=device)
-                )
+                        # attribution originale
+                        orig_attr = dict(
+                            explain(model, tokenizer, text, device=device)
+                        )
 
-                # attribution su testo perturbato (shuffle parole)
-                words = text.split()
-                if len(words) > 5:
-                    g = torch.Generator().manual_seed(0)
-                    perm = torch.randperm(len(words), generator=g)
-                    pert_text = " ".join(words[i] for i in perm)
-                else:
-                    pert_text = text
+                        # attribution su testo perturbato (shuffle parole)
+                        words = text.split()
+                        if len(words) > 5:
+                            g = torch.Generator().manual_seed(0)
+                            perm = torch.randperm(len(words), generator=g)
+                            pert_text = " ".join(words[i] for i in perm)
+                        else:
+                            pert_text = text
 
-                pert_attr = dict(
-                    explain(model, tokenizer, pert_text, device=device)
-                )
+                        pert_attr = dict(
+                            explain(model, tokenizer, pert_text, device=device)
+                        )
 
-                metrics = compute_metrics_for_example(
-                    expl_attrs=orig_attr,
-                    pert_attrs=pert_attr,
-                )
+                        metrics = compute_metrics_for_example(
+                            expl_attrs=orig_attr,
+                            pert_attrs=pert_attr,
+                        )
 
-                rows.append(
-                    dict(
-                        model=mid,
-                        explainer=e_name,
-                        example_id=ex.get("idx", len(rows)),
-                        **metrics,
-                    )
-                )
+                        rows.append(
+                            dict(
+                                model=mid,
+                                explainer=e_name,
+                                example_id=ex.get("idx", len(rows)),
+                                **metrics,
+                            )
+                        )
+                        
+                    except Exception as e:
+                        print(f"    Error on example: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"Error loading model {mid}: {e}")
+            continue
+        
+        # Cleanup memoria dopo ogni modello
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    df = pd.DataFrame(rows)
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    df.to_csv(args.output, index=False)
-    print(f"\nSalvato → {args.output}")
+    if rows:
+        df = pd.DataFrame(rows)
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        df.to_csv(args.output, index=False)
+        print(f"\nSalvato -> {args.output}")
+        print(f"Processati {len(rows)} esempi")
+    else:
+        print("Nessun risultato generato")
 
 
 # ------------------------- RUN ------------------------------
