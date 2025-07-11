@@ -100,7 +100,7 @@ def lrp_detach(
 
     # --- crea LRP e registra la regola per Embedding -----------------
     lrp = LRP(model)
-    emb_rule = EpsilonRule(eps=eps)
+    emb_rule = EpsilonRule(epsilon=1e-6)   # valore di default
     # vale per tutti i sotto-moduli Embedding
     for module in model.modules():
         if isinstance(module, torch.nn.Embedding):
