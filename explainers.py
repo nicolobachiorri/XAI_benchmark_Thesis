@@ -78,38 +78,31 @@ def input_x_gradient(
     tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze())
     return list(zip(tokens, attr.detach().cpu().tolist()))
 
+# ---------- Layer-wise Relevance Propagation (LRP) ----------
 
-
-# ---------- LRP (detach trick + ε-rule) ----------
 from captum.attr import LRP
-from captum.attr._utils.lrp_rules import EpsilonRule   # ‹— nuovo import
+from captum.attr._utils.lrp_rules import EpsilonRule
 
 def lrp_detach(
     model, tokenizer, text,
     target: int = 1,
     device: str = "cuda",
-    eps: float = 1e-6,           # epsilon per stabilizzare
-) -> List[Tuple[str, float]]:
+    eps: float = 1e-6,
+):
     """
-    LRP con 'detach trick' e regola ε sui layer Embedding,
-    così Captum non lancia più l'eccezione.
+    LRP con ‘detach trick’ e regola ε globale.
+    Funziona da Captum 0.6 in poi.
     """
-    # congela i grad
+    # congela i gradienti
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # --- crea LRP e registra la regola per Embedding -----------------
-    lrp = LRP(model)
-    emb_rule = EpsilonRule(epsilon=1e-6)   # valore di default
-    # vale per tutti i sotto-moduli Embedding
-    for module in model.modules():
-        if isinstance(module, torch.nn.Embedding):
-            lrp.rule_dict[type(module)] = emb_rule
-    # -----------------------------------------------------------------
+    # regola ε applicata a tutti i layer
+    lrp = LRP(model, rule=EpsilonRule(epsilon=eps))
 
     enc = tokenizer(text, return_tensors="pt",
                     truncation=True, padding=True).to(device)
-    attributions = (
+    attrs = (
         lrp.attribute(
             enc["input_ids"],
             additional_forward_args=(enc["attention_mask"],),
@@ -120,8 +113,8 @@ def lrp_detach(
     )
 
     tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze())
-    return list(zip(tokens, attributions.detach().cpu().tolist()))
-
+    return list(zip(tokens, attrs.detach().cpu().tolist()))
+# ----------------------------------------------------------------------
 
 # ------------------------------------------------------------
 # 2) PERTURBATION-BASED
