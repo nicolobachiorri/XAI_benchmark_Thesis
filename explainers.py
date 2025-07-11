@@ -81,7 +81,8 @@ def input_x_gradient(
 
 
 # ---------- LRP (detach trick + ε-rule) ----------
-from captum.attr import LRP, EpsilonRule
+from captum.attr import LRP
+from captum.attr._utils.lrp_rules import EpsilonRule   # ‹— nuovo import
 
 def lrp_detach(
     model, tokenizer, text,
