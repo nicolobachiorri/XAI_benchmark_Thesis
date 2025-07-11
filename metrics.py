@@ -7,28 +7,6 @@ EPS = 1e-12  # numerical stability
 
 # ─────────── single metrics ───────────
 
-def human_agreement(expl: List[Tuple[str, float]], human: Set[str], k: int = 10) -> float:
-    """
-    Calculate Average Precision@k for explanation quality.
-    
-    Args:
-        expl: List of (token, score) tuples, sorted by importance
-        human: Set of gold standard rationale tokens
-        k: Number of top tokens to consider
-        
-    Returns:
-        Average Precision@k score [0,1]
-    """
-    if not expl or not human:
-        return 0.0
-        
-    hits = [1 if token in human else 0 for token, _ in expl[:k]]
-    if not any(hits):
-        return 0.0
-        
-    precisions = [sum(hits[:i + 1]) / (i + 1) for i in range(k)]
-    return sum(p * h for p, h in zip(precisions, hits)) / sum(hits)
-
 def precision_at_k(expl: List[Tuple[str, float]], human: Set[str], k: int = 10) -> float:
     """
     Calculate simple Precision@k.
@@ -160,12 +138,11 @@ def faithfulness(attr: Dict[str, float], model_func, input_tokens: List[str],
 
 # ─────────── aggregate scores ───────────
 
-def cws(ha: float, cn: float, ct: float, r_norm: float) -> float:
+def cws(cn: float, ct: float, r_norm: float) -> float:
     """
-    Comprehensive Weighted Score - aggregates multiple metrics.
+    Comprehensive Weighted Score - aggregates 3 metrics (without Human Agreement).
     
     Args:
-        ha: Human agreement score [0,1]
         cn: Consistency score [-1,1] (will be normalized to [0,1])
         ct: Contrastivity score [0,1]
         r_norm: Robustness score [0,1] (0 = robust)
@@ -176,19 +153,18 @@ def cws(ha: float, cn: float, ct: float, r_norm: float) -> float:
     # Normalize consistency to [0,1]
     cn_norm = (cn + 1) / 2
     
-    return 0.25 * ha + 0.25 * cn_norm + 0.25 * ct + 0.25 * (1 - r_norm)
+    return (cn_norm + ct + (1 - r_norm)) / 3
 
-def weighted_cws(ha: float, cn: float, ct: float, r_norm: float, 
-                 weights: Tuple[float, float, float, float] = (0.4, 0.2, 0.2, 0.2)) -> float:
+def weighted_cws(cn: float, ct: float, r_norm: float, 
+                 weights: Tuple[float, float, float] = (0.33, 0.33, 0.34)) -> float:
     """
-    Weighted CWS allowing custom importance weights.
+    Weighted CWS allowing custom importance weights (3 metrics only).
     
     Args:
-        ha: Human agreement score [0,1]
         cn: Consistency score [-1,1]
         ct: Contrastivity score [0,1]
         r_norm: Robustness score [0,1] (0 = robust)
-        weights: Tuple of weights (ha, cn, ct, robustness)
+        weights: Tuple of weights (cn, ct, robustness)
         
     Returns:
         Weighted CWS score [0,1]
@@ -198,24 +174,21 @@ def weighted_cws(ha: float, cn: float, ct: float, r_norm: float,
     # Normalize consistency to [0,1]
     cn_norm = (cn + 1) / 2
     
-    return (weights[0] * ha + 
-            weights[1] * cn_norm + 
-            weights[2] * ct + 
-            weights[3] * (1 - r_norm))
+    return (weights[0] * cn_norm + 
+            weights[1] * ct + 
+            weights[2] * (1 - r_norm))
 
 # ─────────── utility functions ───────────
 
 def evaluate_explanation(expl: List[Tuple[str, float]], 
-                        human_rationales: Set[str],
                         baseline_attr: Dict[str, float] = None,
                         contrasting_attr: Dict[str, float] = None,
                         k: int = 10) -> Dict[str, float]:
     """
-    Comprehensive evaluation of a single explanation.
+    Comprehensive evaluation of a single explanation (without Human Agreement).
     
     Args:
         expl: List of (token, score) tuples
-        human_rationales: Gold standard rationale tokens
         baseline_attr: Baseline attribution for robustness comparison
         contrasting_attr: Contrasting attribution for contrastivity
         k: Number of top tokens to consider
@@ -225,10 +198,7 @@ def evaluate_explanation(expl: List[Tuple[str, float]],
     """
     attr_dict = dict(expl)
     
-    results = {
-        'human_agreement': human_agreement(expl, human_rationales, k),
-        'precision_at_k': precision_at_k(expl, human_rationales, k),
-    }
+    results = {}
     
     if baseline_attr:
         results['robustness'] = robustness(attr_dict, baseline_attr)
@@ -238,9 +208,8 @@ def evaluate_explanation(expl: List[Tuple[str, float]],
         results['contrastivity'] = contrastivity(attr_dict, contrasting_attr)
     
     # Calculate CWS if we have all components
-    if all(key in results for key in ['human_agreement', 'consistency', 'contrastivity', 'robustness']):
+    if all(key in results for key in ['consistency', 'contrastivity', 'robustness']):
         results['cws'] = cws(
-            results['human_agreement'],
             results['consistency'],
             results['contrastivity'],
             results['robustness']
