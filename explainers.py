@@ -78,10 +78,9 @@ def input_x_gradient(
     tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze())
     return list(zip(tokens, attr.detach().cpu().tolist()))
 
-# ---------- Layer-wise Relevance Propagation (LRP) ----------
 
-from captum.attr import LRP
-from captum.attr._utils.lrp_rules import EpsilonRule
+# ---------- LRP (detach trick + ε) ----------
+from captum.attr import LRP 
 
 def lrp_detach(
     model, tokenizer, text,
@@ -90,31 +89,32 @@ def lrp_detach(
     eps: float = 1e-6,
 ):
     """
-    LRP con ‘detach trick’ e regola ε globale.
-    Funziona da Captum 0.6 in poi.
+    LRP con 'detach trick' e regola ε (epsilon) globale.
+    Compatibile con Captum 0.6+.
     """
     # congela i gradienti
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # regola ε applicata a tutti i layer
-    lrp = LRP(model, rule=EpsilonRule(epsilon=eps))
+    lrp = LRP(model)
 
     enc = tokenizer(text, return_tensors="pt",
                     truncation=True, padding=True).to(device)
+
     attrs = (
         lrp.attribute(
             enc["input_ids"],
             additional_forward_args=(enc["attention_mask"],),
             target=target,
+            rule="epsilon",        # ← seleziona ε-rule
+            eps=eps,               # ← valore di stabilizzazione
         )
         .sum(-1)
         .squeeze()
     )
 
     tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze())
-    return list(zip(tokens, attrs.detach().cpu().tolist()))
-# ----------------------------------------------------------------------
+    return list(zip(tokens, attrs.detach().cpu().tolist())) 
 
 # ------------------------------------------------------------
 # 2) PERTURBATION-BASED
