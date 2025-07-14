@@ -58,8 +58,9 @@ class IMDBDatasetManager:
         logger.info("Caricamento dataset IMDB da Hugging Face")
         
         try:
-            # Carica dataset completo
-            dataset = load_dataset("imdb", cache_dir=str(self.cache_dir), trust_remote_code=True)
+            # CORREZIONE: Carica dataset senza cache_dir per evitare problemi con pattern
+            # Il cache viene gestito automaticamente da Hugging Face
+            dataset = load_dataset("imdb")
             
             # Se richiesto subset per testing rapido
             if subset_size is not None:
@@ -87,7 +88,30 @@ class IMDBDatasetManager:
             
         except Exception as e:
             logger.error(f"Errore nel caricamento del dataset IMDB: {str(e)}")
-            raise
+            # CORREZIONE: Fallback con metodo alternativo
+            try:
+                logger.info("Tentativo di caricamento con metodo alternativo...")
+                dataset = load_dataset("imdb", split=None)
+                
+                if subset_size is not None:
+                    logger.info(f"Creazione subset di {subset_size} esempi per testing")
+                    train_subset = dataset["train"].shuffle(seed=random_state).select(range(subset_size))
+                    test_subset = dataset["test"].shuffle(seed=random_state).select(range(subset_size // 4))
+                    
+                    dataset = DatasetDict({
+                        "train": train_subset,
+                        "test": test_subset
+                    })
+                
+                dataset = self._clean_dataset(dataset)
+                self._compute_dataset_stats(dataset)
+                self._raw_dataset = dataset
+                logger.info("Dataset IMDB caricato con successo (metodo alternativo)")
+                return dataset
+                
+            except Exception as e2:
+                logger.error(f"Errore anche con metodo alternativo: {str(e2)}")
+                raise e
     
     def _clean_dataset(self, dataset: DatasetDict) -> DatasetDict:
         """
