@@ -59,7 +59,7 @@ class IMDBDatasetManager:
         
         try:
             # Carica dataset completo
-            dataset = load_dataset("imdb", cache_dir=self.cache_dir)
+            dataset = load_dataset("imdb", cache_dir=str(self.cache_dir), trust_remote_code=True)
             
             # Se richiesto subset per testing rapido
             if subset_size is not None:
