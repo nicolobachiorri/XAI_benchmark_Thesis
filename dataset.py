@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict
 from transformers import AutoTokenizer
 from sklearn.model_selection import train_test_split
 import torch
@@ -37,15 +37,19 @@ class IMDBDatasetManager:
         self.dataset_stats = {}
         
     def load_raw_dataset(self, 
+                        train_file: str = "Train.csv",
+                        test_file: str = "Test.csv",
+                        data_dir: str = ".",
                         subset_size: Optional[int] = None,
-                        test_size: float = 0.2,
                         random_state: int = 42) -> DatasetDict:
         """
-        Carica il dataset IMDB raw
+        Carica il dataset IMDB dai file CSV locali
         
         Args:
+            train_file: Nome del file CSV di training
+            test_file: Nome del file CSV di test
+            data_dir: Directory contenente i file CSV
             subset_size: Se specificato, usa solo un subset per testing
-            test_size: Proporzione del test set (se non specificata nel dataset)
             random_state: Seed per riproducibilità
             
         Returns:
@@ -55,25 +59,47 @@ class IMDBDatasetManager:
             logger.info("Dataset IMDB già caricato dalla cache")
             return self._raw_dataset
             
-        logger.info("Caricamento dataset IMDB da Hugging Face")
+        logger.info("Caricamento dataset IMDB da file CSV locali")
         
         try:
-            # CORREZIONE: Carica dataset senza cache_dir per evitare problemi con pattern
-            # Il cache viene gestito automaticamente da Hugging Face
-            dataset = load_dataset("imdb")
+            # Percorsi dei file
+            data_path = Path(data_dir)
+            train_path = data_path / train_file
+            test_path = data_path / test_file
+            
+            # Verifica esistenza file
+            if not train_path.exists():
+                raise FileNotFoundError(f"File di training non trovato: {train_path}")
+            if not test_path.exists():
+                raise FileNotFoundError(f"File di test non trovato: {test_path}")
+            
+            logger.info(f"Caricamento file di training: {train_path}")
+            logger.info(f"Caricamento file di test: {test_path}")
+            
+            # Carica i CSV
+            train_df = pd.read_csv(train_path)
+            test_df = pd.read_csv(test_path)
+            
+            logger.info(f"Training set: {len(train_df)} righe, colonne: {list(train_df.columns)}")
+            logger.info(f"Test set: {len(test_df)} righe, colonne: {list(test_df.columns)}")
+            
+            # Standardizza i nomi delle colonne
+            train_df = self._standardize_columns(train_df)
+            test_df = self._standardize_columns(test_df)
+            
+            # Crea il DatasetDict
+            train_dataset = Dataset.from_pandas(train_df, preserve_index=False)
+            test_dataset = Dataset.from_pandas(test_df, preserve_index=False)
+            
+            dataset = DatasetDict({
+                'train': train_dataset,
+                'test': test_dataset
+            })
             
             # Se richiesto subset per testing rapido
             if subset_size is not None:
                 logger.info(f"Creazione subset di {subset_size} esempi per testing")
-                
-                # Prendi subset bilanciato
-                train_subset = dataset["train"].shuffle(seed=random_state).select(range(subset_size))
-                test_subset = dataset["test"].shuffle(seed=random_state).select(range(subset_size // 4))
-                
-                dataset = DatasetDict({
-                    "train": train_subset,
-                    "test": test_subset
-                })
+                dataset = self._create_subset(dataset, subset_size, random_state)
             
             # Verifica e pulisci i dati
             dataset = self._clean_dataset(dataset)
@@ -82,36 +108,122 @@ class IMDBDatasetManager:
             self._compute_dataset_stats(dataset)
             
             self._raw_dataset = dataset
-            logger.info("Dataset IMDB caricato con successo")
+            logger.info("Dataset IMDB caricato con successo dai file CSV locali")
             
             return dataset
             
         except Exception as e:
             logger.error(f"Errore nel caricamento del dataset IMDB: {str(e)}")
-            # CORREZIONE: Fallback con metodo alternativo
-            try:
-                logger.info("Tentativo di caricamento con metodo alternativo...")
-                dataset = load_dataset("imdb", split=None)
-                
-                if subset_size is not None:
-                    logger.info(f"Creazione subset di {subset_size} esempi per testing")
-                    train_subset = dataset["train"].shuffle(seed=random_state).select(range(subset_size))
-                    test_subset = dataset["test"].shuffle(seed=random_state).select(range(subset_size // 4))
-                    
-                    dataset = DatasetDict({
-                        "train": train_subset,
-                        "test": test_subset
-                    })
-                
-                dataset = self._clean_dataset(dataset)
-                self._compute_dataset_stats(dataset)
-                self._raw_dataset = dataset
-                logger.info("Dataset IMDB caricato con successo (metodo alternativo)")
-                return dataset
-                
-            except Exception as e2:
-                logger.error(f"Errore anche con metodo alternativo: {str(e2)}")
-                raise e
+            raise
+    
+    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Standardizza i nomi delle colonne del dataset
+        
+        Args:
+            df: DataFrame con colonne originali
+            
+        Returns:
+            DataFrame con colonne standardizzate
+        """
+        # Mappa nomi colonne comuni a standard
+        column_mapping = {
+            'review': 'text',
+            'Review': 'text',
+            'sentiment': 'label',
+            'Sentiment': 'label',
+            'polarity': 'label',
+            'Polarity': 'label'
+        }
+        
+        # Rinomina colonne se necessario
+        df = df.rename(columns=column_mapping)
+        
+        # Verifica che abbiamo le colonne necessarie
+        if 'text' not in df.columns:
+            # Prova a trovare la colonna del testo
+            text_candidates = [col for col in df.columns 
+                             if any(keyword in col.lower() for keyword in ['text', 'review', 'comment', 'content'])]
+            if text_candidates:
+                df = df.rename(columns={text_candidates[0]: 'text'})
+            else:
+                raise ValueError(f"Impossibile trovare colonna del testo. Colonne disponibili: {list(df.columns)}")
+        
+        if 'label' not in df.columns:
+            # Prova a trovare la colonna delle label
+            label_candidates = [col for col in df.columns 
+                              if any(keyword in col.lower() for keyword in ['label', 'sentiment', 'target', 'class'])]
+            if label_candidates:
+                df = df.rename(columns={label_candidates[0]: 'label'})
+            else:
+                raise ValueError(f"Impossibile trovare colonna delle label. Colonne disponibili: {list(df.columns)}")
+        
+        # Converti label testuali in numeriche se necessario
+        if df['label'].dtype == 'object':
+            logger.info("Conversione label testuali in numeriche")
+            # Mapping più robusto per diversi formati
+            df['label'] = df['label'].astype(str).str.lower().str.strip()
+            
+            label_mapping = {
+                'positive': 1, 'negative': 0,
+                'pos': 1, 'neg': 0,
+                '1': 1, '0': 0,
+                'true': 1, 'false': 0,
+                'good': 1, 'bad': 0
+            }
+            
+            df['label'] = df['label'].map(label_mapping)
+            
+            # Rimuovi righe con label non riconosciute
+            before_cleaning = len(df)
+            df = df.dropna(subset=['label'])
+            after_cleaning = len(df)
+            
+            if before_cleaning != after_cleaning:
+                logger.warning(f"Rimosse {before_cleaning - after_cleaning} righe con label non riconosciute")
+            
+            df['label'] = df['label'].astype(int)
+        
+        # Converti label numeriche se necessario
+        elif df['label'].dtype in ['float64', 'int64']:
+            df['label'] = df['label'].astype(int)
+            # Assicurati che le label siano 0 e 1
+            unique_labels = df['label'].unique()
+            if not all(label in [0, 1] for label in unique_labels):
+                logger.warning(f"Label non standard trovate: {unique_labels}")
+                # Se hai label come -1, 1 o 1, 2, etc., rimappa
+                if set(unique_labels) == {-1, 1}:
+                    df['label'] = df['label'].map({-1: 0, 1: 1})
+                elif set(unique_labels) == {1, 2}:
+                    df['label'] = df['label'].map({1: 0, 2: 1})
+        
+        logger.info(f"Colonne standardizzate: {list(df.columns)}")
+        logger.info(f"Distribuzione label: {df['label'].value_counts().to_dict()}")
+        
+        return df
+    
+    def _create_subset(self, dataset: DatasetDict, subset_size: int, random_state: int) -> DatasetDict:
+        """
+        Crea un subset bilanciato del dataset
+        
+        Args:
+            dataset: Dataset completo
+            subset_size: Numero totale di esempi nel subset
+            random_state: Seed per riproducibilità
+            
+        Returns:
+            DatasetDict con subset
+        """
+        train_size = int(subset_size * 0.8)  # 80% per train
+        test_size = subset_size - train_size  # 20% per test
+        
+        train_subset = dataset["train"].shuffle(seed=random_state).select(range(min(train_size, len(dataset["train"]))))
+        test_subset = dataset["test"].shuffle(seed=random_state).select(range(min(test_size, len(dataset["test"]))))
+        
+        return DatasetDict({
+            "train": train_subset,
+            "test": test_subset
+        })
     
     def _clean_dataset(self, dataset: DatasetDict) -> DatasetDict:
         """
@@ -137,9 +249,12 @@ class IMDBDatasetManager:
             # Verifica range delle label (0=negative, 1=positive)
             df = df[df['label'].isin([0, 1])]
             
+            # Rimuovi duplicati
+            df = df.drop_duplicates(subset=['text'])
+            
             final_size = len(df)
             if initial_size != final_size:
-                logger.info(f"Rimossi {initial_size - final_size} esempi malformati")
+                logger.info(f"Rimossi {initial_size - final_size} esempi malformati/duplicati")
             
             # Converte di nuovo in Dataset
             return Dataset.from_pandas(df, preserve_index=False)
@@ -346,7 +461,7 @@ class IMDBDatasetManager:
     def get_dataset_info(self) -> Dict[str, Any]:
         """Restituisce informazioni complete sul dataset"""
         info = {
-            "dataset_name": "IMDB Movie Reviews",
+            "dataset_name": "IMDB Movie Reviews (Local CSV)",
             "task": "Binary Sentiment Classification",
             "num_labels": self.num_labels,
             "label_mapping": {0: "negative", 1: "positive"},
@@ -387,13 +502,18 @@ class IMDBDatasetManager:
 def test_dataset_loading():
     """Test rapido del caricamento dataset"""
     try:
-        print("\nTEST: Caricamento dataset IMDB")
+        print("\nTEST: Caricamento dataset IMDB da CSV locali")
         
         # Inizializza manager
         dataset_manager = IMDBDatasetManager()
         
-        # Carica subset per test rapido
-        raw_dataset = dataset_manager.load_raw_dataset(subset_size=200)
+        # Carica dataset (subset per test rapido)
+        raw_dataset = dataset_manager.load_raw_dataset(
+            train_file="Train.csv",
+            test_file="Test.csv",
+            data_dir=".",
+            subset_size=200  # Subset piccolo per test
+        )
         
         print("SUCCESS: Dataset raw caricato")
         dataset_manager.print_dataset_info()
@@ -417,6 +537,8 @@ def test_dataset_loading():
         
     except Exception as e:
         print(f"FAILED: Test fallito: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
