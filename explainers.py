@@ -111,8 +111,8 @@ class LIMEExplainer(BaseExplainer):
             raise ImportError("LIME non disponibile. Installare con: pip install lime")
         
         self.explainer = LimeTextExplainer(
-            class_names=['negative', 'positive'],
-            mode='classification'
+            class_names=['negative', 'positive']
+            # mode='classification' rimosso per compatibilità LIME
         )
         
     def explain(self, text: str, target_class: Optional[int] = None) -> Dict[str, Any]:
