@@ -1,263 +1,401 @@
-# dataset.py - versione robusta
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer
-from utils import set_seed
-import logging
-import torch
-from typing import Tuple, Optional, Union
+"""
+XAI Benchmark - Dataset Module
+Gestisce il caricamento, preprocessing e tokenization del dataset IMDB per sentiment analysis
+"""
+
 import os
+import logging
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+from datasets import Dataset, DatasetDict, load_dataset
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+import torch
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_imdb(
-    tokenizer_name: str, 
-    max_len: int = 256,
-    cache_dir: Optional[str] = None,
-    subset_size: Optional[int] = None,
-    force_download: bool = False
-) -> Tuple[Dataset, Dataset]:
-    """
-    Carica e tokenizza il dataset IMDB con gestione robusta degli errori.
+
+class IMDBDatasetManager:
+    """Gestisce il dataset IMDB per sentiment analysis binaria"""
     
-    Args:
-        tokenizer_name: Nome del tokenizer da usare
-        max_len: Lunghezza massima delle sequenze
-        cache_dir: Directory per cache (opzionale)
-        subset_size: Numero di esempi per split (per testing rapido)
-        force_download: Forza download del dataset
-    
-    Returns:
-        Tuple[Dataset, Dataset]: (train_dataset, test_dataset)
-    """
-    try:
-        set_seed()
+    def __init__(self, cache_dir: str = "./dataset_cache", max_length: int = 512):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
         
-        # Carica tokenizer con gestione errori
-        logger.info(f"Loading tokenizer: {tokenizer_name}")
+        self.max_length = max_length
+        self.num_labels = 2  # Binary sentiment: 0=negative, 1=positive
+        
+        # Dataset raw
+        self._raw_dataset = None
+        self._tokenized_datasets = {}  # Cache per tokenized datasets
+        
+        # Statistiche
+        self.dataset_stats = {}
+        
+    def load_raw_dataset(self, 
+                        subset_size: Optional[int] = None,
+                        test_size: float = 0.2,
+                        random_state: int = 42) -> DatasetDict:
+        """
+        Carica il dataset IMDB raw
+        
+        Args:
+            subset_size: Se specificato, usa solo un subset per testing
+            test_size: Proporzione del test set (se non specificata nel dataset)
+            random_state: Seed per riproducibilità
+            
+        Returns:
+            DatasetDict con train/test splits
+        """
+        if self._raw_dataset is not None and subset_size is None:
+            logger.info("Dataset IMDB già caricato dalla cache")
+            return self._raw_dataset
+            
+        logger.info("Caricamento dataset IMDB da Hugging Face")
+        
         try:
-            tok = AutoTokenizer.from_pretrained(
-                tokenizer_name, 
-                use_fast=True,
-                trust_remote_code=False,  # Sicurezza
-                cache_dir=cache_dir
-            )
+            # Carica dataset completo
+            dataset = load_dataset("imdb", cache_dir=self.cache_dir)
+            
+            # Se richiesto subset per testing rapido
+            if subset_size is not None:
+                logger.info(f"Creazione subset di {subset_size} esempi per testing")
+                
+                # Prendi subset bilanciato
+                train_subset = dataset["train"].shuffle(seed=random_state).select(range(subset_size))
+                test_subset = dataset["test"].shuffle(seed=random_state).select(range(subset_size // 4))
+                
+                dataset = DatasetDict({
+                    "train": train_subset,
+                    "test": test_subset
+                })
+            
+            # Verifica e pulisci i dati
+            dataset = self._clean_dataset(dataset)
+            
+            # Calcola statistiche
+            self._compute_dataset_stats(dataset)
+            
+            self._raw_dataset = dataset
+            logger.info("Dataset IMDB caricato con successo")
+            
+            return dataset
+            
         except Exception as e:
-            logger.warning(f"Failed to load fast tokenizer, trying slow: {e}")
-            tok = AutoTokenizer.from_pretrained(
-                tokenizer_name, 
-                use_fast=False,
-                trust_remote_code=False,
-                cache_dir=cache_dir
+            logger.error(f"Errore nel caricamento del dataset IMDB: {str(e)}")
+            raise
+    
+    def _clean_dataset(self, dataset: DatasetDict) -> DatasetDict:
+        """
+        Pulisce e valida il dataset
+        
+        Args:
+            dataset: Dataset raw da pulire
+            
+        Returns:
+            Dataset pulito
+        """
+        logger.info("Pulizia e validazione dataset")
+        
+        def clean_split(split_data):
+            # Converti in pandas per manipolazione più facile
+            df = split_data.to_pandas()
+            
+            # Rimuovi righe vuote o malformate
+            initial_size = len(df)
+            df = df.dropna(subset=['text', 'label'])
+            df = df[df['text'].str.len() > 0]  # Rimuovi testi vuoti
+            
+            # Verifica range delle label (0=negative, 1=positive)
+            df = df[df['label'].isin([0, 1])]
+            
+            final_size = len(df)
+            if initial_size != final_size:
+                logger.info(f"Rimossi {initial_size - final_size} esempi malformati")
+            
+            # Converte di nuovo in Dataset
+            return Dataset.from_pandas(df, preserve_index=False)
+        
+        # Applica pulizia a tutti gli split
+        cleaned_dataset = DatasetDict()
+        for split_name, split_data in dataset.items():
+            cleaned_dataset[split_name] = clean_split(split_data)
+            
+        return cleaned_dataset
+    
+    def _compute_dataset_stats(self, dataset: DatasetDict):
+        """Calcola statistiche del dataset"""
+        logger.info("Calcolo statistiche dataset")
+        
+        stats = {}
+        
+        for split_name, split_data in dataset.items():
+            df = split_data.to_pandas()
+            
+            # Statistiche di base
+            stats[split_name] = {
+                "size": len(df),
+                "label_distribution": df['label'].value_counts().to_dict(),
+                "text_length_stats": {
+                    "mean": df['text'].str.len().mean(),
+                    "median": df['text'].str.len().median(),
+                    "min": df['text'].str.len().min(),
+                    "max": df['text'].str.len().max(),
+                    "std": df['text'].str.len().std()
+                }
+            }
+            
+            # Calcola percentuale di balance
+            label_counts = df['label'].value_counts()
+            total = len(df)
+            stats[split_name]["label_balance"] = {
+                "negative_pct": (label_counts.get(0, 0) / total) * 100,
+                "positive_pct": (label_counts.get(1, 0) / total) * 100
+            }
+        
+        self.dataset_stats = stats
+        
+        # Log delle statistiche principali
+        for split_name, split_stats in stats.items():
+            logger.info(f"{split_name.upper()}: {split_stats['size']} esempi, "
+                       f"Balance: {split_stats['label_balance']['negative_pct']:.1f}% neg / "
+                       f"{split_stats['label_balance']['positive_pct']:.1f}% pos")
+    
+    def tokenize_dataset(self, 
+                        tokenizer: AutoTokenizer,
+                        dataset: Optional[DatasetDict] = None) -> DatasetDict:
+        """
+        Tokenizza il dataset con un tokenizer specifico
+        
+        Args:
+            tokenizer: Tokenizer da utilizzare
+            dataset: Dataset da tokenizzare (se None, usa quello caricato)
+            
+        Returns:
+            Dataset tokenizzato
+        """
+        if dataset is None:
+            if self._raw_dataset is None:
+                raise ValueError("Nessun dataset caricato. Chiama prima load_raw_dataset()")
+            dataset = self._raw_dataset
+        
+        # Check cache
+        tokenizer_name = getattr(tokenizer, 'name_or_path', 'unknown')
+        cache_key = f"{tokenizer_name}_{self.max_length}"
+        
+        if cache_key in self._tokenized_datasets:
+            logger.info(f"Dataset tokenizzato trovato in cache per {tokenizer_name}")
+            return self._tokenized_datasets[cache_key]
+        
+        logger.info(f"Tokenizzazione dataset con {tokenizer_name}")
+        
+        def tokenize_function(examples):
+            """Funzione di tokenizzazione"""
+            # Tokenizza i testi
+            tokenized = tokenizer(
+                examples['text'],
+                truncation=True,
+                padding=False,  # Padding dinamico durante training
+                max_length=self.max_length,
+                return_attention_mask=True,
+                return_token_type_ids=False  # Non necessario per sentiment analysis
             )
+            
+            # Assicurati che le label siano nel formato corretto
+            tokenized['labels'] = examples['label']
+            
+            return tokenized
         
-        # Aggiungi pad_token se mancante
-        if tok.pad_token is None:
-            if tok.eos_token is not None:
-                tok.pad_token = tok.eos_token
-            elif tok.unk_token is not None:
-                tok.pad_token = tok.unk_token
+        try:
+            # Applica tokenizzazione a tutti gli split
+            tokenized_dataset = dataset.map(
+                tokenize_function,
+                batched=True,
+                remove_columns=dataset["train"].column_names,  # Rimuovi colonne originali
+                desc="Tokenizing dataset"
+            )
+            
+            # Imposta formato per PyTorch
+            tokenized_dataset.set_format(
+                type="torch",
+                columns=["input_ids", "attention_mask", "labels"]
+            )
+            
+            # Cache del risultato
+            self._tokenized_datasets[cache_key] = tokenized_dataset
+            
+            logger.info("Tokenizzazione completata")
+            return tokenized_dataset
+            
+        except Exception as e:
+            logger.error(f"Errore durante tokenizzazione: {str(e)}")
+            raise
+    
+    def create_subset_for_evaluation(self, 
+                                   tokenized_dataset: DatasetDict,
+                                   eval_size: int = 100,
+                                   random_state: int = 42) -> DatasetDict:
+        """
+        Crea un subset per valutazione rapida dei metodi XAI
+        
+        Args:
+            tokenized_dataset: Dataset tokenizzato
+            eval_size: Numero di esempi per il subset
+            random_state: Seed per riproducibilità
+            
+        Returns:
+            Subset del dataset per valutazione XAI
+        """
+        logger.info(f"Creazione subset di valutazione ({eval_size} esempi)")
+        
+        subset_dataset = DatasetDict()
+        
+        for split_name, split_data in tokenized_dataset.items():
+            if len(split_data) >= eval_size:
+                # Seleziona subset bilanciato
+                df = split_data.to_pandas()
+                
+                # Stratified sampling per mantenere balance delle classi
+                subset_df = df.groupby('labels', group_keys=False).apply(
+                    lambda x: x.sample(min(len(x), eval_size // 2), random_state=random_state)
+                ).reset_index(drop=True)
+                
+                # Mescola il subset finale
+                subset_df = subset_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+                
+                # Converte di nuovo in Dataset
+                subset_dataset[split_name] = Dataset.from_pandas(subset_df, preserve_index=False)
+                subset_dataset[split_name].set_format(
+                    type="torch",
+                    columns=["input_ids", "attention_mask", "labels"]
+                )
             else:
-                # Fallback per tokenizer problematici
-                tok.add_special_tokens({'pad_token': '[PAD]'})
-            logger.info(f"Set pad_token to: {tok.pad_token}")
+                # Se il split è più piccolo del subset richiesto, usa tutto
+                subset_dataset[split_name] = split_data
         
-        # Carica dataset
-        logger.info("Loading IMDB dataset...")
-        dataset_kwargs = {
-            "cache_dir": cache_dir,
+        return subset_dataset
+    
+    def get_human_annotations_sample(self, 
+                                   tokenized_dataset: DatasetDict,
+                                   sample_size: int = 50,
+                                   random_state: int = 42) -> List[Dict[str, Any]]:
+        """
+        Crea un campione per annotazioni umane (per metrica Human Agreement)
+        
+        Args:
+            tokenized_dataset: Dataset tokenizzato
+            sample_size: Numero di esempi da annotare
+            random_state: Seed per riproducibilità
+            
+        Returns:
+            Lista di esempi per annotazione umana
+        """
+        logger.info(f"Creazione campione per annotazioni umane ({sample_size} esempi)")
+        
+        # Usa il test set per le annotazioni
+        test_data = tokenized_dataset["test"].to_pandas()
+        
+        # Sample stratificato
+        sample_df = test_data.groupby('labels', group_keys=False).apply(
+            lambda x: x.sample(min(len(x), sample_size // 2), random_state=random_state)
+        ).reset_index(drop=True)
+        
+        # Prepara dati per annotazione
+        annotation_samples = []
+        for idx, row in sample_df.iterrows():
+            # Decodifica il testo dal tokenizer (richiede tokenizer)
+            sample = {
+                "id": idx,
+                "input_ids": row["input_ids"].tolist(),
+                "attention_mask": row["attention_mask"].tolist(),
+                "true_label": int(row["labels"]),
+                "true_label_text": "positive" if row["labels"] == 1 else "negative"
+            }
+            annotation_samples.append(sample)
+        
+        return annotation_samples
+    
+    def get_dataset_info(self) -> Dict[str, Any]:
+        """Restituisce informazioni complete sul dataset"""
+        info = {
+            "dataset_name": "IMDB Movie Reviews",
+            "task": "Binary Sentiment Classification",
+            "num_labels": self.num_labels,
+            "label_mapping": {0: "negative", 1: "positive"},
+            "max_length": self.max_length,
+            "cache_dir": str(self.cache_dir),
+            "statistics": self.dataset_stats
         }
         
-        if force_download:
-            dataset_kwargs["download_mode"] = "force_redownload"
-        
-        try:
-            raw = load_dataset("imdb", **dataset_kwargs)
-        except Exception as e:
-            logger.error(f"Error loading IMDB dataset: {e}")
-            # Fallback con cache disabilitata
-            logger.info("Trying without cache...")
-            raw = load_dataset("imdb")
-        
-        # Prendi subset se richiesto (per testing rapido)
-        if subset_size is not None:
-            logger.info(f"Taking subset of {subset_size} examples per split")
-            raw["train"] = raw["train"].select(range(min(subset_size, len(raw["train"]))))
-            raw["test"] = raw["test"].select(range(min(subset_size, len(raw["test"]))))
-        
-        # Funzione di tokenizzazione robusta
-        def tokenize_function(batch):
-            try:
-                # Gestisce casi dove 'text' potrebbe essere None o vuoto
-                texts = []
-                for text in batch["text"]:
-                    if text is None or text == "":
-                        texts.append("[EMPTY]")  # Placeholder per testi vuoti
-                    else:
-                        texts.append(str(text))  # Assicura che sia stringa
-                
-                result = tok(
-                    texts,
-                    truncation=True,
-                    padding="max_length",
-                    max_length=max_len,
-                    return_tensors=None,  # Lascia come liste per ora
-                    add_special_tokens=True,
-                )
-                
-                # Verifica che tutto sia andato bene
-                if not all(len(ids) == max_len for ids in result["input_ids"]):
-                    logger.warning("Some sequences have wrong length after tokenization")
-                
-                return result
-                
-            except Exception as e:
-                logger.error(f"Error in tokenization: {e}")
-                # Fallback con tokenizzazione base
-                return {
-                    "input_ids": [[tok.unk_token_id] * max_len] * len(batch["text"]),
-                    "attention_mask": [[1] * max_len] * len(batch["text"]),
-                }
-        
-        # Applica tokenizzazione
-        logger.info("Tokenizing dataset...")
-        try:
-            tokenized = raw.map(
-                tokenize_function,
-                batched=True,
-                batch_size=1000,  # Batch size ragionevole
-                num_proc=1,       # Evita problemi multiprocessing
-                remove_columns=[],  # Non rimuovere colonne qui
-                desc="Tokenizing"
-            )
-        except Exception as e:
-            logger.error(f"Error during tokenization: {e}")
-            # Fallback senza batching
-            logger.info("Trying without batching...")
-            tokenized = raw.map(
-                tokenize_function,
-                batched=True,
-                batch_size=100,
-                num_proc=1,
-                desc="Tokenizing (fallback)"
-            )
-        
-        # Rinomina colonna label
-        tokenized = tokenized.rename_column("label", "labels")
-        
-        # Aggiungi indici
-        for split in tokenized.keys():
-            tokenized[split] = tokenized[split].add_column(
-                "idx", 
-                list(range(len(tokenized[split])))
-            )
-        
-        # Configura formato PyTorch con gestione errori
-        logger.info("Setting PyTorch format...")
-        for split in tokenized.keys():
-            try:
-                tokenized[split].set_format(
-                    type="torch",
-                    columns=["input_ids", "attention_mask", "labels"],
-                    output_all_columns=True,
-                )
-            except Exception as e:
-                logger.error(f"Error setting format for {split}: {e}")
-                # Fallback: converti manualmente
-                tokenized[split] = convert_to_torch_manually(tokenized[split])
-        
-        train_dataset = tokenized["train"]
-        test_dataset = tokenized["test"]
-        
-        logger.info(f"Dataset loaded successfully:")
-        logger.info(f"  Train size: {len(train_dataset)}")
-        logger.info(f"  Test size: {len(test_dataset)}")
-        logger.info(f"  Max length: {max_len}")
-        
-        return train_dataset, test_dataset
-        
-    except Exception as e:
-        logger.error(f"Critical error in get_imdb: {e}")
-        raise
-
-def convert_to_torch_manually(dataset):
-    """Fallback per conversione manuale a formato PyTorch"""
-    def convert_batch(batch):
-        # Converte manualmente le colonne necessarie
-        for key in ["input_ids", "attention_mask", "labels"]:
-            if key in batch:
-                batch[key] = torch.tensor(batch[key])
-        return batch
+        return info
     
-    return dataset.map(convert_batch, batched=True)
+    def print_dataset_info(self):
+        """Stampa informazioni sul dataset in formato leggibile"""
+        info = self.get_dataset_info()
+        
+        print("\nDATASET INFORMATION:")
+        print("=" * 60)
+        print(f"Dataset: {info['dataset_name']}")
+        print(f"Task: {info['task']}")
+        print(f"Labels: {info['num_labels']} ({info['label_mapping']})")
+        print(f"Max Length: {info['max_length']} tokens")
+        print()
+        
+        if info['statistics']:
+            print("STATISTICS:")
+            for split_name, stats in info['statistics'].items():
+                print(f"\n{split_name.upper()}:")
+                print(f"  Size: {stats['size']:,} examples")
+                print(f"  Balance: {stats['label_balance']['negative_pct']:.1f}% negative, "
+                      f"{stats['label_balance']['positive_pct']:.1f}% positive")
+                print(f"  Text Length: {stats['text_length_stats']['mean']:.0f} ± "
+                      f"{stats['text_length_stats']['std']:.0f} chars "
+                      f"(min={stats['text_length_stats']['min']}, "
+                      f"max={stats['text_length_stats']['max']})")
+        
+        print("=" * 60)
 
-def get_imdb_small(tokenizer_name: str, max_len: int = 256) -> Tuple[Dataset, Dataset]:
-    """Versione ridotta per testing rapido"""
-    return get_imdb(
-        tokenizer_name=tokenizer_name,
-        max_len=max_len,
-        subset_size=1000  # Solo 1000 esempi per split
-    )
 
-def validate_dataset(dataset: Dataset) -> bool:
-    """Valida che il dataset sia stato caricato correttamente"""
+def test_dataset_loading():
+    """Test rapido del caricamento dataset"""
     try:
-        # Controlla che abbia le colonne necessarie
-        required_columns = ["input_ids", "attention_mask", "labels", "text", "idx"]
-        missing_columns = [col for col in required_columns if col not in dataset.column_names]
+        print("\nTEST: Caricamento dataset IMDB")
         
-        if missing_columns:
-            logger.error(f"Missing columns: {missing_columns}")
-            return False
+        # Inizializza manager
+        dataset_manager = IMDBDatasetManager()
         
-        # Controlla un campione
-        sample = dataset[0]
+        # Carica subset per test rapido
+        raw_dataset = dataset_manager.load_raw_dataset(subset_size=200)
         
-        # Verifica dimensioni
-        if len(sample["input_ids"]) != len(sample["attention_mask"]):
-            logger.error("Mismatch between input_ids and attention_mask length")
-            return False
+        print("SUCCESS: Dataset raw caricato")
+        dataset_manager.print_dataset_info()
         
-        # Verifica tipi
-        if not isinstance(sample["labels"], (int, torch.Tensor)):
-            logger.error(f"Labels should be int or tensor, got {type(sample['labels'])}")
-            return False
+        # Test tokenizzazione (richiede un tokenizer)
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
         
-        logger.info("Dataset validation passed")
+        tokenized_dataset = dataset_manager.tokenize_dataset(tokenizer)
+        print("SUCCESS: Dataset tokenizzato")
+        
+        # Test subset per XAI evaluation
+        eval_subset = dataset_manager.create_subset_for_evaluation(tokenized_dataset, eval_size=20)
+        print(f"SUCCESS: Subset XAI creato - {len(eval_subset['test'])} esempi")
+        
+        # Test sample per annotazioni umane
+        human_samples = dataset_manager.get_human_annotations_sample(tokenized_dataset, sample_size=10)
+        print(f"SUCCESS: Campione annotazioni umane - {len(human_samples)} esempi")
+        
         return True
         
     except Exception as e:
-        logger.error(f"Dataset validation failed: {e}")
+        print(f"FAILED: Test fallito: {str(e)}")
         return False
 
-# Utility per debugging
-def print_dataset_info(dataset: Dataset, name: str = "Dataset"):
-    """Stampa informazioni dettagliate sul dataset"""
-    logger.info(f"\n{name} Info:")
-    logger.info(f"  Size: {len(dataset)}")
-    logger.info(f"  Columns: {dataset.column_names}")
-    logger.info(f"  Features: {dataset.features}")
-    
-    # Mostra un esempio
-    if len(dataset) > 0:
-        sample = dataset[0]
-        logger.info(f"  Sample keys: {list(sample.keys())}")
-        logger.info(f"  Input IDs shape: {len(sample['input_ids']) if 'input_ids' in sample else 'N/A'}")
-        logger.info(f"  Text preview: {sample.get('text', 'N/A')[:100]}...")
 
-# Test rapido
 if __name__ == "__main__":
-    # Test con un tokenizer semplice
-    try:
-        train, test = get_imdb_small("distilbert-base-uncased", max_len=128)
-        print_dataset_info(train, "Train")
-        print_dataset_info(test, "Test")
-        
-        if validate_dataset(train) and validate_dataset(test):
-            logger.info("Dataset test passed!")
-        else:
-            logger.error("Dataset test failed!")
-            
-    except Exception as e:
-        logger.error(f"Test failed: {e}")
+    # Demo
+    test_dataset_loading()
