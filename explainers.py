@@ -98,6 +98,9 @@ def _captum_explainer(cls, model, tokenizer):
             # gradient × input: attr = grad * input
             input_embeds = model.get_input_embeddings()(input_ids)
             input_embeds.requires_grad_(True)
+            input_embeds.retain_grad()          
+
+            model.zero_grad()   
             logits = _forward_func(model, input_ids, attention_mask)
             logits.backward(torch.ones_like(logits))
             attributions = input_embeds.grad * input_embeds
