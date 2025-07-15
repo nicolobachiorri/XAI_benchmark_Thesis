@@ -281,10 +281,10 @@ def _kernel_shap(model, tokenizer):
 
 
 # -------------------------------------------------------------------------
-_EXPLAINER_FACTORY: Dict[str, Callable] = {
+_EXPLAINER_FACTORY = {
     "lime":               _lime_text,
     "shap":               _kernel_shap,
-    "grad_input":         lambda m, t: _captum_explainer(InputXGradient, m, t),
+    "grad_input":         _grad_input,          # <-- aggiornata
     "attention_rollout":  _attention_rollout,
     "attention_flow":     _attention_flow,
     "lrp":                _lrp,
