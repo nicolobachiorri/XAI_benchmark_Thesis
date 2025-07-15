@@ -1,217 +1,302 @@
 """
-explainers.py – 6 metodi XAI per modelli Transformer di sentiment analysis
-===========================================================================
+explainers.py – Six XAI methods for Transformer models
+======================================================
 
-Explainer supportati (stringhe chiave → classe/func):
-* **integrated_gradients**  – Captum `IntegratedGradients`
-* **gradient_shap**         – Captum `GradientShap`
-* **grad_input**            – Captum `GradientAttribution` (gradient × input)
-* **attention_rollout**     – media pesata delle attention heads (Attn Roll‑out)
-* **lime**                  – LIME Text (parole come features)
-* **kernel_shap**           – SHAP KernelExplainer (testo → proba)
+Explainers
+----------
+lime               -> LIME‑Text
+shap               -> SHAP KernelExplainer
+grad_input         -> Captum InputXGradient  (gradient × input)
+attention_rollout  -> Mean attention roll‑out (Abnar & Zuidema, 2020)
+attention_flow     -> Attention Flow (Abnar & Zuidema, 2020)
+lrp                -> Layer‑wise Relevance Propagation (last encoder layer)
 
-Dipendenze:
-    pip install captum lime shap
-
-Esempio:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    import torch
-    from explainers import get_explainer
-
-    model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased")
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    model.eval()
-
-    explainer = get_explainer("integrated_gradients", model, tokenizer)
-    attributions = explainer("I loved the movie, it was great!")
-    print(list(zip(attributions.tokens, attributions.scores)))
+Returned API
+------------
+get_explainer(name, model, tokenizer) -> callable
+    expl(text) -> Attribution(tokens, scores)
 """
 
-# ==== 1. Librerie ====
 from __future__ import annotations
-from typing import List, Callable, Dict, Union
+from typing import List, Dict, Callable
+
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
-# Captum per metodi gradient‑based
+# -------------------------------------------------------------------------
+# Captum imports (optional)
 try:
     from captum.attr import (
         IntegratedGradients,
         GradientShap,
-        GradientAttribution,  # base class per gradient × input
+        InputXGradient,
+        LayerLRP,
     )
-except ImportError:  # fallback per chi non ha captum installato
-    IntegratedGradients = GradientShap = GradientAttribution = None  # type: ignore
+except ImportError:
+    IntegratedGradients = GradientShap = InputXGradient = LayerLRP = None  # type: ignore
 
-# LIME & SHAP sono opzionali
+# LIME & SHAP imports (optional)
 try:
     from lime.lime_text import LimeTextExplainer
 except ImportError:
     LimeTextExplainer = None  # type: ignore
 
 try:
-    import shap  # noqa: F401
+    import shap
+    import numpy as np
 except ImportError:
     shap = None  # type: ignore
-
-# ==== 2. Helper: forward function compatibile Captum ====
-
-def _forward_func(model: PreTrainedModel, input_ids: torch.Tensor, attention_mask: torch.Tensor):
-    """Ritorna le logit della classe positiva (indice 1) – Captum expects tensor output."""
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = outputs.logits  # shape (B, num_labels)
-    # per Captum serve 1D o 2D; prendiamo probabilità/logit della classe 1
-    class_idx = 1 if logits.size(-1) > 1 else 0
-    return logits[:, class_idx]
+    np = None    # type: ignore
 
 
-# ==== 3. Wrapper di attributions per uniformità ====
+# -------------------------------------------------------------------------
+def _forward_func(model: PreTrainedModel,
+                  input_ids: torch.Tensor,
+                  attention_mask: torch.Tensor):
+    """Return logit of positive class (idx 1)."""
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    idx = 1 if logits.size(-1) > 1 else 0
+    return logits[:, idx]
+
+
 class Attribution:
-    """Contiene token list e score list allineate."""
-
+    """Container for tokens and their importance scores."""
     def __init__(self, tokens: List[str], scores: List[float]):
         self.tokens = tokens
         self.scores = scores
 
     def __repr__(self):
-        pairs = ", ".join(f"{t}:{s:.3f}" for t, s in zip(self.tokens, self.scores))
-        return f"Attribution([{pairs}])"
+        joined = ", ".join(f"{t}:{s:.3f}" for t, s in zip(self.tokens, self.scores))
+        return f"Attribution([{joined}])"
 
 
-# ==== 4. Implementazioni dei 6 explainers ====
-
+# -------------------------------------------------------------------------
+# 1) Generic Captum wrapper (IG / GS / InputXGradient)
 def _captum_explainer(cls, model, tokenizer):
-    """Factory generica per metodi Captum (IG, GradientShap, Grad × Input)."""
-
     def explain(text: str) -> Attribution:
         model.eval()
-        encoding = tokenizer(text, return_tensors="pt")
-        input_ids = encoding["input_ids"]
-        attention_mask = encoding["attention_mask"]
+        enc = tokenizer(text, return_tensors="pt")
+        ids, attn = enc["input_ids"], enc["attention_mask"]
 
-        # baseline (zeros) per IntegratedGradients/GradientShap
-        baseline = torch.zeros_like(input_ids)
-
-        attr_alg = cls(model, _forward_func) if cls is not GradientAttribution else cls()
-        if isinstance(attr_alg, GradientAttribution):
-            # gradient × input: attr = grad * input
-            input_embeds = model.get_input_embeddings()(input_ids)
-            input_embeds.requires_grad_(True)
-            input_embeds.retain_grad()          
-
-            model.zero_grad()   
-            logits = _forward_func(model, input_ids, attention_mask)
-            logits.backward(torch.ones_like(logits))
-            attributions = input_embeds.grad * input_embeds
-            scores = attributions.sum(dim=-1).squeeze(0)  # shape: seq_len
+        if cls is InputXGradient:
+            alg = cls(model)
+            attr = alg.attribute(ids, additional_forward_args=(attn,))
         else:
-            attributions, _ = attr_alg.attribute(
-                inputs=input_ids,
+            baseline = torch.zeros_like(ids)
+            alg = cls(model, _forward_func)
+            attr, _ = alg.attribute(
+                ids,
                 baselines=baseline,
-                additional_forward_args=(attention_mask,),
+                additional_forward_args=(attn,),
                 return_convergence_delta=False,
             )
-            scores = attributions.sum(dim=-1).squeeze(0)
 
-        tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze(0))
+        scores = attr.sum(dim=-1).squeeze(0)
+        tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
+        return Attribution(tokens, scores.tolist())
+    return explain
+
+
+# -------------------------------------------------------------------------
+# ATTENTION ROLLOUT (Abnar & Zuidema, 2020)
+# -------------------------------------------------------------------------
+def _attention_rollout(model, tokenizer, head_avg: str = "mean"):
+    """
+    Calcola l’Attention Rollout:
+        R_L   =  A_L
+        R_l   =  (A_l   @ R_{l+1})      per l=L-1 … 0
+    dove A_l è l’attenzione (heads raggruppate) già
+    corretta per le residual connection:   Â = 0.5·A + 0.5·I
+    Il risultato finale è la rilevanza dei token input rispetto a [CLS].
+    """
+    factor = 0.5   # peso per residual, come nel paper
+
+    def explain(text: str):
+        model.eval()
+        enc = tokenizer(text, return_tensors="pt", output_attentions=True)
+        with torch.no_grad():
+            outs = model(**enc)
+
+        # media o max sui heads
+        if head_avg == "mean":
+            att_stack = torch.stack([a.mean(dim=1) for a in outs.attentions])   # (L,B,seq,seq)
+        elif head_avg == "max":
+            att_stack = torch.stack([a.max(dim=1).values for a in outs.attentions])
+        else:
+            raise ValueError("head_avg deve essere 'mean' o 'max'")
+
+        # aggiungi residual e rinormalizza riga per riga
+        I = torch.eye(att_stack.size(-1)).unsqueeze(0).unsqueeze(0)             # (1,1,seq,seq)
+        att_stack = factor * att_stack + factor * I
+        att_stack = att_stack / att_stack.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        # rollout cumulativo dal basso verso l’alto
+        rollout = att_stack[-1]                  # start: ultimo layer (B,seq,seq)
+        for l in range(att_stack.size(0) - 2, -1, -1):
+            rollout = att_stack[l].bmm(rollout)
+
+        scores = rollout.squeeze(0)[0]           # attenzione da [CLS] (indice 0)
+        tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
         return Attribution(tokens, scores.tolist())
 
     return explain
 
 
-def _attention_rollout(model, tokenizer):
-    """Media pesata delle attention matrices lungo tutti i layer e heads."""
+# -------------------------------------------------------------------------
+# ATTENTION FLOW (Abnar & Zuidema, 2020)
+# -------------------------------------------------------------------------
+def _attention_flow(model, tokenizer, head_avg: str = "mean"):
+    """
+    Implementa il Maximum‑Flow descritto da Abnar & Zuidema.
+    Complessità O(L²·n⁴) ma per frasi brevi è accettabile.
+    """
+    import networkx as nx                      # richiede  networkx>=2
+
+    factor = 0.5
+
+    def explain(text: str):
+        model.eval()
+        enc = tokenizer(text, return_tensors="pt", output_attentions=True)
+        with torch.no_grad():
+            outs = model(**enc)
+
+        # heads -> (L,B,seq,seq)
+        if head_avg == "mean":
+            attn = torch.stack([a.mean(dim=1) for a in outs.attentions])
+        elif head_avg == "max":
+            attn = torch.stack([a.max(dim=1).values for a in outs.attentions])
+        else:
+            raise ValueError("head_avg deve essere 'mean' o 'max'")
+
+        seq_len = attn.size(-1)
+        I = torch.eye(seq_len).unsqueeze(0).unsqueeze(0)
+        attn = factor * attn + factor * I
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        # Costruisci grafo a più layer
+        G = nx.DiGraph()
+        L = attn.size(0)
+
+        # nodi: (layer, pos)  ─ sorgente = (L,pos)  target   = (0,pos0)
+        for l in range(L):
+            for i in range(seq_len):
+                G.add_node((l, i))
+
+        # archi con capacità = peso attenzione
+        for l in range(L):
+            for i in range(seq_len):           # from (l,i)
+                for j in range(seq_len):       # to   (l-1,j)
+                    w = attn[l, 0, i, j].item()   # B=1
+                    if w > 0:
+                        G.add_edge((l, i), (l - 1, j), capacity=w)
+
+        # flusso massimo da ogni token del top‑layer a ogni input token
+        cls_scores = torch.zeros(seq_len)
+        for src in range(seq_len):
+            flow_val, flow_dict = nx.maximum_flow(G, (L - 1, src), (0, 0))
+            cls_scores[src] = flow_val
+
+        tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
+        return Attribution(tokens, cls_scores.tolist())
+
+    return explain
+
+
+
+# -------------------------------------------------------------------------
+# 4) LRP (LayerLRP on last encoder layer)
+def _lrp(model, tokenizer):
+    if LayerLRP is None:
+        raise ImportError("Captum non installato: pip install captum")
+
+    # heuristic: last encoder block
+    try:
+        target_layer = model.bert.encoder.layer[-1]
+    except AttributeError:
+        raise ValueError("LRP: modello non ha struttura BERT standard")
+
+    lrp = LayerLRP(model, target_layer)
 
     def explain(text: str) -> Attribution:
         model.eval()
-        encoding = tokenizer(text, return_tensors="pt", output_attentions=True)
-        with torch.no_grad():
-            outputs = model(**encoding)
-            attn = outputs.attentions  # tuple(layer) each (B, heads, seq, seq)
+        enc = tokenizer(text, return_tensors="pt")
+        ids, attn = enc["input_ids"], enc["attention_mask"]
 
-        # Rollout: media su heads, poi prodotto cumulativo layer‑wise (simplified)
-        attn_avg = torch.stack([a.mean(dim=1) for a in attn])  # shape (L, B, seq, seq)
-        joint_attn = attn_avg[0]
-        for i in range(1, attn_avg.size(0)):
-            joint_attn = attn_avg[i].bmm(joint_attn)
-        scores = joint_attn.squeeze(0)[0]  # attention from [CLS] → altri token
-        tokens = tokenizer.convert_ids_to_tokens(encoding["input_ids"].squeeze(0))
+        relev = lrp.attribute(ids, additional_forward_args=(attn,),
+                              internal_batch_size=1)
+        scores = relev.sum(dim=-1).squeeze(0)
+        tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
         return Attribution(tokens, scores.tolist())
-
     return explain
 
 
+# -------------------------------------------------------------------------
+# 5) LIME‑Text
 def _lime_text(model, tokenizer):
     if LimeTextExplainer is None:
-        raise ImportError("LIME non installato. `pip install lime`")
+        raise ImportError("LIME non installato: pip install lime")
 
     class_names = ["neg", "pos"]
     explainer = LimeTextExplainer(class_names=class_names)
 
-    def predict_proba(texts: List[str]):
+    def predict(texts: List[str]):
         enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
             logits = model(**enc).logits
-            probs = F.softmax(logits, dim=-1).cpu().numpy()
+        probs = F.softmax(logits, dim=-1).cpu().numpy()
         return probs
 
     def explain(text: str) -> Attribution:
-        exp = explainer.explain_instance(text, predict_proba, num_features=10)
-        # exp.as_list() -> List[(word, score)]
+        exp = explainer.explain_instance(text, predict, num_features=10)
         tokens, scores = zip(*exp.as_list())
         return Attribution(list(tokens), list(scores))
-
     return explain
 
 
+# -------------------------------------------------------------------------
+# 6) SHAP KernelExplainer
 def _kernel_shap(model, tokenizer):
-    if shap is None:
-        raise ImportError("SHAP non installato. `pip install shap`")
+    if shap is None or np is None:
+        raise ImportError("SHAP non installato: pip install shap")
 
-    import numpy as np
-    from shap import KernelExplainer
-
-    def predict_proba(texts: List[str]):
+    def predict(texts: List[str]):
         enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
             logits = model(**enc).logits
-            probs = F.softmax(logits, dim=-1).cpu().numpy()
-        return probs
+        return F.softmax(logits, dim=-1).cpu().numpy()
 
-    # usare un background di 1 frase neutra
-    explainer = KernelExplainer(predict_proba, np.array(["."]))
+    explainer = shap.KernelExplainer(predict, np.array(["."]))
 
     def explain(text: str) -> Attribution:
-        shap_values = explainer.shap_values([text], nsamples=100)
-        # shap_values è lista per ogni classe; usiamo classe positiva (1)
-        token_scores = shap_values[1][0]
-        tokens = text.split()  # shap tokenizza per parola
-        return Attribution(tokens, token_scores.tolist())
-
+        shap_vals = explainer.shap_values([text], nsamples=100)
+        scores = shap_vals[1][0]  # positive class
+        tokens = text.split()
+        return Attribution(tokens, scores.tolist())
     return explain
 
-# ==== 5. Factory pubblica ====
-_EXPLAINER_FACTORY: Dict[str, Callable[[PreTrainedModel, PreTrainedTokenizer], Callable[[str], Attribution]]] = {
-    "integrated_gradients": lambda m, t: _captum_explainer(IntegratedGradients, m, t),
-    "gradient_shap":        lambda m, t: _captum_explainer(GradientShap, m, t),
-    "grad_input":           lambda m, t: _captum_explainer(GradientAttribution, m, t),
-    "attention_rollout":    _attention_rollout,
-    "lime":                 _lime_text,
-    "kernel_shap":          _kernel_shap,
+
+# -------------------------------------------------------------------------
+_EXPLAINER_FACTORY: Dict[str, Callable] = {
+    "lime":               _lime_text,
+    "shap":               _kernel_shap,
+    "grad_input":         lambda m, t: _captum_explainer(InputXGradient, m, t),
+    "attention_rollout":  _attention_rollout,
+    "attention_flow":     _attention_flow,
+    "lrp":                _lrp,
 }
 
-
-def list_explainers() -> List[str]:
-    """Ritorna la lista di stringhe valide per `get_explainer`."""
+# -------------------------------------------------------------------------
+def list_explainers():
     return list(_EXPLAINER_FACTORY.keys())
 
 
-def get_explainer(name: str, model: PreTrainedModel, tokenizer: PreTrainedTokenizer):
-    """Restituisce una funzione `explain(text) -> Attribution`."""
+def get_explainer(name: str,
+                  model: PreTrainedModel,
+                  tokenizer: PreTrainedTokenizer):
     name = name.lower()
     if name not in _EXPLAINER_FACTORY:
-        raise ValueError(f"Explainer '{name}' non supportato. Usa uno di {list_explainers()}")
-    if IntegratedGradients is None and name in {"integrated_gradients", "gradient_shap", "grad_input"}:
-        raise ImportError("Captum non installato. `pip install captum`")
+        raise ValueError(f"Explainer '{name}' non supportato")
+    if IntegratedGradients is None and name in {"grad_input"}:
+        raise ImportError("Captum non installato: pip install captum")
     return _EXPLAINER_FACTORY[name](model, tokenizer)
