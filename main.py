@@ -103,8 +103,8 @@ def main():
     # ---- evaluate ----
     p_eval = subparsers.add_parser("evaluate", help="Valuta modello+explainer su una metrica")
     # Non ridefiniamo tutte le opzioni qui; pass‑through a evaluate.py
-    p_eval.add_argument("--", nargs=argparse.REMAINDER, help="Argomenti per evaluate.py (vedi relativo help)")
-    p_eval.set_defaults(func=_cmd_evaluate)
+    #p_eval.add_argument("--", nargs=argparse.REMAINDER, help="Argomenti per evaluate.py (vedi relativo help)")
+    p_eval.set_defaults(func=_cmd_evaluate) 
 
     # ---- explain ----
     p_expl = subparsers.add_parser("explain", help="Genera spiegazione token‑level di una frase")
@@ -113,19 +113,16 @@ def main():
     p_expl.add_argument("--text", required=True, help="Frase da spiegare")
     p_expl.set_defaults(func=_cmd_explain)
 
-    # Parse args separando quelli dopo "--" (solo per evaluate)
-    if "--" in sys.argv:
-        idx = sys.argv.index("--")
-        args, rest = parser.parse_args(sys.argv[1:idx]), sys.argv[idx + 1 :]
-    else:
-        args, rest = parser.parse_args(), []
 
-    # Esegui comando appropriato
+    # --- PARSING --- #
+    # restituisce (args riconosciuti, lista degli altri)
+    args, rest = parser.parse_known_args()
+
+    # Esegui il comando appropriato
     if args.command == "evaluate":
-        args.func(args, rest)
+        _cmd_evaluate(args, rest)      # passiamo la lista extra a evaluate.py
     else:
         args.func(args)
-
 
 if __name__ == "__main__":
     main()
