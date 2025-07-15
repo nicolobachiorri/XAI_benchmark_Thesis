@@ -72,30 +72,34 @@ class Attribution:
 
 
 # -------------------------------------------------------------------------
-# 1) Generic Captum wrapper (IG / GS / InputXGradient)
-def _captum_explainer(cls, model, tokenizer):
+# 1) 
+# GRADIENT × INPUT (embedding‑level, senza Captum)
+def _grad_input(model, tokenizer):
     def explain(text: str) -> Attribution:
         model.eval()
         enc = tokenizer(text, return_tensors="pt")
         ids, attn = enc["input_ids"], enc["attention_mask"]
 
-        if cls is InputXGradient:
-            alg = cls(model)
-            attr = alg.attribute(ids, additional_forward_args=(attn,))
-        else:
-            baseline = torch.zeros_like(ids)
-            alg = cls(model, _forward_func)
-            attr, _ = alg.attribute(
-                ids,
-                baselines=baseline,
-                additional_forward_args=(attn,),
-                return_convergence_delta=False,
-            )
+        # ottieni embeddings e abilita i gradienti
+        embeds = model.get_input_embeddings()(ids).detach()
+        embeds.requires_grad_(True)
 
-        scores = attr.sum(dim=-1).squeeze(0)
+        # forward usando inputs_embeds
+        outputs = model(inputs_embeds=embeds, attention_mask=attn)
+        logits = outputs.logits
+        target = 1 if logits.size(-1) > 1 else 0    # classe positiva
+        loss = logits[:, target].sum()
+
+        # backward
+        model.zero_grad()
+        loss.backward()
+
+        grads = embeds.grad        # shape (B, seq, dim)
+        scores = (grads * embeds).sum(dim=-1).squeeze(0)  # grad × input
         tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
         return Attribution(tokens, scores.tolist())
     return explain
+
 
 
 # -------------------------------------------------------------------------
