@@ -127,6 +127,7 @@ def fine_tune(
             per_device_eval_batch_size=BATCH_SIZE,
             learning_rate=lr,
             logging_steps=50,
+            report_to="none", 
             seed=SEED,
         )
     # ---------------------------------------------------------------
