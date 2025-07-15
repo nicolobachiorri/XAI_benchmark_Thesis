@@ -1,178 +1,92 @@
 """
-XAI Benchmark - Utilities Module
-Funzioni di supporto essenziali per il progetto
+utils.py – Utility comuni per il progetto XAI Benchmark
+======================================================
+
+File pensato per raccogliere **piccole funzioni riusabili** senza dipendenze
+pesanti, in modo da non ripetere codice in più script.
+
+Funzionalità principali
+-----------------------
+1. **set_seed(seed)** – fissa seed per *random*, *numpy*, *torch* (+ CUDA).
+2. **chunk_iter(iterable, size)** – genera mini‑batch di grandezza fissa.
+3. **save_json(path, obj) / load_json(path)** – lettura/scrittura JSON semplice
+   (gestisce *Path* o stringa). Usa indent=2 per leggere comodamente i file.
+4. **tqdm_wrapper(dataloader)** – progress bar già configurata per loop su
+   *torch.utils.data.DataLoader*.
+
+
 """
 
-import os
-import random
-import shutil
-import pickle
+from __future__ import annotations
+
 import json
+import random
+from pathlib import Path
+from typing import Any, Iterable, Iterator, List, Sequence, TypeVar
+
 import numpy as np
 import torch
-from pathlib import Path
-from typing import Any, Dict, Union
-import logging
+from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+__all__: List[str] = [
+    "set_seed",
+    "chunk_iter",
+    "save_json",
+    "load_json",
+    "tqdm_wrapper",
+]
 
+T = TypeVar("T")
 
-# ================== SEED MANAGEMENT ==================
+# ==== 1. Reproducibilità globale ====
 
-def set_global_seed(seed: int = 42):
-    """Imposta seed globale per riproducibilità"""
+def set_seed(seed: int) -> None:
+    """Fissa tutti i generatori di random per garantire esperimenti riproducibili."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    logger.info(f"Global seed impostato a {seed}")
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-# ================== PATH UTILITIES ==================
+# ==== 2. Suddivisione iterabile ====
 
-def ensure_dir(path: Union[str, Path]) -> Path:
-    """Assicura che una directory esista"""
-    dir_path = Path(path)
-    dir_path.mkdir(parents=True, exist_ok=True)
-    return dir_path
-
-
-def safe_filename(filename: str) -> str:
-    """Rende un filename sicuro per il filesystem"""
-    unsafe_chars = '<>:"/\\|?*'
-    safe_name = filename
-    
-    for char in unsafe_chars:
-        safe_name = safe_name.replace(char, '_')
-    
-    return safe_name.strip()
+def chunk_iter(iterable: Iterable[T], size: int) -> Iterator[List[T]]:
+    """Divide un iterabile in liste di lunghezza `size` (ultima più corta)."""
+    chunk: List[T] = []
+    for item in iterable:
+        chunk.append(item)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
 
 
-# ================== CACHE UTILITIES ==================
+# ==== 3. I/O JSON semplificato ====
 
-def get_cache_size(cache_dir: Union[str, Path]) -> str:
-    """Calcola dimensione della cache in formato leggibile"""
-    cache_path = Path(cache_dir)
-    if not cache_path.exists():
-        return "0 B"
-    
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(cache_path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.exists(fp):
-                total_size += os.path.getsize(fp)
-    
-    # Converti in formato leggibile
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if total_size < 1024.0:
-            return f"{total_size:.1f} {unit}"
-        total_size /= 1024.0
-    return f"{total_size:.1f} TB"
+def _as_path(path: str | Path) -> Path:
+    return path if isinstance(path, Path) else Path(path)
 
 
-def clear_cache(cache_dir: Union[str, Path]):
-    """Rimuove tutta la cache"""
-    cache_path = Path(cache_dir)
-    if cache_path.exists():
-        shutil.rmtree(cache_path)
-        cache_path.mkdir(exist_ok=True)
-        logger.info("Cache rimossa")
+def save_json(path: str | Path, obj: Any) -> None:
+    """Salva `obj` (serializzabile JSON) su disco con indentazione leggibile."""
+    p = _as_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-# ================== FILE UTILITIES ==================
-
-def save_json(data: Dict[str, Any], filepath: Union[str, Path]):
-    """Salva dizionario in JSON"""
-    filepath = Path(filepath)
-    ensure_dir(filepath.parent)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False, default=str)
-
-
-def load_json(filepath: Union[str, Path]) -> Dict[str, Any]:
-    """Carica dizionario da JSON"""
-    with open(filepath, 'r', encoding='utf-8') as f:
+def load_json(path: str | Path) -> Any:
+    """Carica un oggetto da file JSON."""
+    p = _as_path(path)
+    with p.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_pickle(obj: Any, filepath: Union[str, Path]):
-    """Salva oggetto in pickle"""
-    filepath = Path(filepath)
-    ensure_dir(filepath.parent)
-    
-    with open(filepath, 'wb') as f:
-        pickle.dump(obj, f)
+# ==== 4. Progress bar DataLoader ====
 
-
-def load_pickle(filepath: Union[str, Path]) -> Any:
-    """Carica oggetto da pickle"""
-    with open(filepath, 'rb') as f:
-        return pickle.load(f)
-
-
-# ================== SYSTEM INFO ==================
-
-def get_system_info() -> Dict[str, Any]:
-    """Restituisce informazioni base del sistema"""
-    import platform
-    
-    return {
-        'platform': platform.platform(),
-        'python_version': platform.python_version(),
-        'torch_version': torch.__version__,
-        'cuda_available': torch.cuda.is_available(),
-        'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0
-    }
-
-
-def print_system_info():
-    """Stampa informazioni sistema"""
-    info = get_system_info()
-    
-    print("\nSYSTEM INFO:")
-    print(f"Python: {info['python_version']}")
-    print(f"PyTorch: {info['torch_version']}")
-    print(f"CUDA: {info['cuda_available']}")
-    if info['cuda_available']:
-        print(f"GPUs: {info['gpu_count']}")
-
-
-# ================== TEST ==================
-
-def test_utils():
-    """Test delle utility"""
-    print("TEST: Utils module")
-    
-    try:
-        set_global_seed(42)
-        print("SUCCESS: Seed management")
-        
-        test_dir = ensure_dir("./test_utils")
-        print("SUCCESS: Path utilities")
-        
-        cache_size = get_cache_size("./")
-        print(f"SUCCESS: Cache utilities - {cache_size}")
-        
-        print_system_info()
-        print("SUCCESS: System info")
-        
-        # Cleanup
-        if test_dir.exists():
-            shutil.rmtree(test_dir)
-        
-        return True
-        
-    except Exception as e:
-        print(f"FAILED: {e}")
-        return False
-
-
-if __name__ == "__main__":
-    test_utils()
+def tqdm_wrapper(dataloader: torch.utils.data.DataLoader, desc: str | None = None):
+    """Ritorna un `tqdm` configurato per iterare sul dataloader."""
+    return tqdm(dataloader, total=len(dataloader), desc=desc or "Batches", leave=False)
