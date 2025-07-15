@@ -99,21 +99,38 @@ def fine_tune(
     run_name = f"{model_key}{'-frozen' if freeze_backbone else ''}"
     output_subdir = OUTPUT_DIR / run_name
 
-    args = TrainingArguments(
-        output_dir=output_subdir.as_posix(),
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        learning_rate=lr,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        logging_steps=50,
-        seed=SEED,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        report_to="none",  # disattiva WandB per semplicità
-        run_name=run_name,
-    )
+    # ---------------------------------------------------------------
+    # TrainingArguments: tentativo "ricco" + fallback "compatto"
+    try:
+        args = TrainingArguments(
+            output_dir=output_subdir.as_posix(),
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=BATCH_SIZE,
+            per_device_eval_batch_size=BATCH_SIZE,
+            learning_rate=lr,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            logging_steps=50,
+            seed=SEED,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            report_to="none",
+            run_name=run_name,
+        )
+    except TypeError as e:
+        # log minimal info, poi ricadi su versione base
+        print("[WARN] TrainingArguments ridotti, motivo:", e)
+        args = TrainingArguments(
+            output_dir=output_subdir.as_posix(),
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=BATCH_SIZE,
+            per_device_eval_batch_size=BATCH_SIZE,
+            learning_rate=lr,
+            logging_steps=50,
+            seed=SEED,
+        )
+    # ---------------------------------------------------------------
+
 
     trainer = Trainer(
         model=model,
