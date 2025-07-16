@@ -1,24 +1,19 @@
 # Core ML & NLP
-
 torch>=2.2.0
 transformers>=4.41.0
 accelerate>=0.27.0
-sentencepiece>=0.2.0  # xlm‑roberta tokenizer
-sacremoses>=0.1.1      # optional for BERT
 
 # Data manipulation
-
 pandas>=2.2.2
 scikit-learn>=1.5.0
 numpy>=1.26.4
 scipy>=1.12.0
 
-# XAI & metrics
-
+# XAI methods
 captum>=0.7.0
 lime>=0.2.0
 shap>=0.45.0
+networkx>=3.0
 
 # Utilities
-
 tqdm>=4.66.0

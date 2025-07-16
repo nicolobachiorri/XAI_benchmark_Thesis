@@ -1,26 +1,19 @@
 """
-report.py – Genera tabelle aggregate (Robustness / Consistency / Contrastivity)
-==============================================================================
+report.py – Genera tabelle per le metriche XAI
+==============================================
 
-Questo script produce, in formato *Markdown* (stampato in console) o *CSV*, le
-stesse tabelle quantitative del paper, calcolando le metriche sui modelli e
-explainer definiti nel progetto.
+Crea tabelle con risultati di Robustness, Consistency e Contrastivity
+per tutti i modelli e explainer.
 
-Esempio d’uso (tutte le metriche, sample=500):
-    python report.py --sample 500 --out markdown
-
-Solo Robustness in CSV:
-    python report.py --metric robustness --out csv --sample 300 > robustness.csv
-
-Requisiti: aver già fine‑tunato (o scaricato) i modelli indicati in MODELS.
+Uso:
+    python report.py                    # Tutte le metriche, 500 esempi
+    python report.py --sample 300       # 300 esempi
+    python report.py --metric robustness # Solo robustness
+    python report.py --csv              # Output CSV invece di markdown
 """
-
-from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from pathlib import Path
-from typing import Dict, List, Tuple
 
 import pandas as pd
 
@@ -28,124 +21,157 @@ import models
 import dataset
 import explainers
 import metrics
-from utils import set_seed
+from utils import set_seed, Timer
 
-# ---- Configurazioni facili da cambiare -----------------------------------
+# Configurazione
+EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow", "lrp"]
 METRICS = ["robustness", "contrastivity", "consistency"]
-EXPLAINERS = [
-    "lime",
-    "shap",
-    "lrp",  # alias per grad_input (se preferisci cambiare nome)
-    "integrated_gradients",  # InputXGradient nel paper → grad_input; qui IG per esempio
-    "grad_input",            # gradient × input – usa tu il mapping che vuoi
-    "attention_rollout",     # AMV nel paper (approx.)
-]
-
-# mappa alias per stampare nome riga paper‑style
-ROW_NAMES = {
-    "lrp": "LRP",
-    "grad_input": "InputXGradient",
-    "attention_rollout": "AMV",
-    "integrated_gradients": "IntegratedGradients",
-}
-
-# -------------------------------------------------------------------------
 
 set_seed(42)
 
-# Pre‑carica testo e label per il test‑set (una sola volta)
-TEST_TEXTS, TEST_LABELS = dataset.test_df["text"].tolist(), dataset.test_df["label"].tolist()
-
-# -------------------------------------------------------------------------
-
-def _get_subset(texts: List[str], labels: List[int], sample: int | None):
-    if sample and sample < len(texts):
-        return texts[:sample], labels[:sample]
+def get_test_data(sample_size=None):
+    """Carica dati di test."""
+    texts = dataset.test_df["text"].tolist()
+    labels = dataset.test_df["label"].tolist()
+    
+    if sample_size and sample_size < len(texts):
+        # Campionamento stratificato
+        pos_texts = [t for t, l in zip(texts, labels) if l == 1][:sample_size//2]
+        neg_texts = [t for t, l in zip(texts, labels) if l == 0][:sample_size//2]
+        texts = pos_texts + neg_texts
+        labels = [1] * len(pos_texts) + [0] * len(neg_texts)
+    
     return texts, labels
 
-# ------------------- funzioni metriche wrapper ---------------------------
-
-def _score_robustness(model_key: str, explainer_name: str, sample: int | None):
+def eval_robustness(model_key, explainer_name, sample_size):
+    """Valuta robustness."""
     model = models.load_model(model_key)
-    tok = models.load_tokenizer(model_key)
-    expl = explainers.get_explainer(explainer_name, model, tok)
-    texts, _ = _get_subset(TEST_TEXTS, TEST_LABELS, sample)
-    return metrics.evaluate_robustness_over_dataset(model, tok, expl, texts)
+    tokenizer = models.load_tokenizer(model_key)
+    explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+    texts, _ = get_test_data(sample_size)
+    return metrics.evaluate_robustness_over_dataset(model, tokenizer, explainer, texts)
 
-
-def _score_contrastivity(model_key: str, explainer_name: str, sample: int | None):
+def eval_contrastivity(model_key, explainer_name, sample_size):
+    """Valuta contrastivity."""
     model = models.load_model(model_key)
-    tok = models.load_tokenizer(model_key)
-    expl = explainers.get_explainer(explainer_name, model, tok)
-    texts, labels = _get_subset(TEST_TEXTS, TEST_LABELS, sample)
-    pos, neg = [], []
-    for t, l in zip(texts, labels):
-        (pos if l == 1 else neg).append(expl(t))
-    return metrics.compute_contrastivity(pos, neg)
+    tokenizer = models.load_tokenizer(model_key)
+    explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+    texts, labels = get_test_data(sample_size)
+    
+    # Separa per classe
+    pos_attrs = []
+    neg_attrs = []
+    
+    for text, label in zip(texts, labels):
+        attr = explainer(text)
+        if label == 1:
+            pos_attrs.append(attr)
+        else:
+            neg_attrs.append(attr)
+    
+    return metrics.compute_contrastivity(pos_attrs, neg_attrs)
 
-
-def _score_consistency(model_key: str, explainer_name: str, sample: int | None):
-    """Richiede due checkpoint dello *stesso* modello con seed diversi.
-    Per semplicità carichiamo lo stesso modello due volte (seed diversi nel
-    fine‑tuning) se avete salvato come "<model_key>_seed1" / "<model_key>_seed2".
-    Qui si assume che esistano tali checkpoint; altrimenti la funzione ritorna
-    NaN.
-    """
-    key_a = f"{model_key}_seed1"
-    key_b = f"{model_key}_seed2"
-    if key_a not in models.MODELS or key_b not in models.MODELS:
-        return float("nan")
-
-    m1 = models.load_model(key_a)
-    m2 = models.load_model(key_b)
-    t1 = models.load_tokenizer(key_a)
-    t2 = models.load_tokenizer(key_b)
+def eval_consistency(model_a, model_b, explainer_name, sample_size):
+    """Valuta consistency tra due modelli."""
+    # Carica modelli
+    m1 = models.load_model(model_a)
+    m2 = models.load_model(model_b)
+    t1 = models.load_tokenizer(model_a)
+    t2 = models.load_tokenizer(model_b)
     e1 = explainers.get_explainer(explainer_name, m1, t1)
     e2 = explainers.get_explainer(explainer_name, m2, t2)
-    texts, _ = _get_subset(TEST_TEXTS, TEST_LABELS, sample)
+    
+    texts, _ = get_test_data(sample_size)
     return metrics.evaluate_consistency_over_dataset(m1, m2, t1, t2, e1, e2, texts)
 
-
-_METRIC_FUNC = {
-    "robustness": _score_robustness,
-    "contrastivity": _score_contrastivity,
-    "consistency": _score_consistency,
-}
-
-# -------------------------------------------------------------------------
-
-def build_table(metric: str, sample: int | None) -> pd.DataFrame:
-    results: Dict[str, Dict[str, float]] = defaultdict(dict)
-    for expl in EXPLAINERS:
+def build_robustness_table(sample_size):
+    """Tabella robustness: explainer x modelli."""
+    print("Calcolando robustness...")
+    results = defaultdict(dict)
+    
+    for explainer in EXPLAINERS:
         for model_key in models.MODELS.keys():
-            score = _METRIC_FUNC[metric](model_key, expl, sample)
-            results[expl][model_key] = score
-    df = pd.DataFrame(results).T  # righe = explainer
-    df.index = [ROW_NAMES.get(idx, idx).upper() for idx in df.index]
-    df.columns = [c.replace("-", "").upper() for c in df.columns]
-    return df
+            try:
+                with Timer(f"{explainer} + {model_key}"):
+                    score = eval_robustness(model_key, explainer, sample_size)
+                results[explainer][model_key] = score
+            except Exception as e:
+                print(f"Errore {explainer}+{model_key}: {e}")
+                results[explainer][model_key] = float('nan')
+    
+    return pd.DataFrame(results).T
 
+def build_contrastivity_table(sample_size):
+    """Tabella contrastivity: explainer x modelli."""
+    print("Calcolando contrastivity...")
+    results = defaultdict(dict)
+    
+    for explainer in EXPLAINERS:
+        for model_key in models.MODELS.keys():
+            try:
+                with Timer(f"{explainer} + {model_key}"):
+                    score = eval_contrastivity(model_key, explainer, sample_size)
+                results[explainer][model_key] = score
+            except Exception as e:
+                print(f"Errore {explainer}+{model_key}: {e}")
+                results[explainer][model_key] = float('nan')
+    
+    return pd.DataFrame(results).T
+
+def build_consistency_table(sample_size):
+    """Tabella consistency: explainer x coppie modelli."""
+    print("Calcolando consistency...")
+    results = defaultdict(dict)
+    
+    model_list = list(models.MODELS.keys())
+    
+    for explainer in EXPLAINERS:
+        for i, model_a in enumerate(model_list):
+            for model_b in model_list[i+1:]:  # Solo coppie uniche
+                pair_name = f"{model_a}_vs_{model_b}"
+                try:
+                    with Timer(f"{explainer} + {pair_name}"):
+                        score = eval_consistency(model_a, model_b, explainer, sample_size)
+                    results[explainer][pair_name] = score
+                except Exception as e:
+                    print(f"Errore {explainer}+{pair_name}: {e}")
+                    results[explainer][pair_name] = float('nan')
+    
+    return pd.DataFrame(results).T
 
 def main():
-    parser = argparse.ArgumentParser("Genera tabelle XAI")
+    parser = argparse.ArgumentParser(description="Genera tabelle XAI")
     parser.add_argument("--metric", choices=METRICS + ["all"], default="all")
-    parser.add_argument("--sample", type=int, default=500, help="Numero esempi test, None=tutti")
-    parser.add_argument("--out", choices=["markdown", "csv"], default="markdown")
+    parser.add_argument("--sample", type=int, default=500)
+    parser.add_argument("--csv", action="store_true", help="Output CSV")
     args = parser.parse_args()
 
-    metrics_to_run = METRICS if args.metric == "all" else [args.metric]
+    print(f"Generando tabelle con {args.sample} esempi...")
+    
+    # Scegli metriche
+    if args.metric == "all":
+        metrics_to_run = METRICS
+    else:
+        metrics_to_run = [args.metric]
 
-    for met in metrics_to_run:
-        df = build_table(met, args.sample)
-        print(f"\n### {met.capitalize()} (sample={args.sample})\n")
-        if args.out == "markdown":
-            print(df.to_markdown(floatfmt=".4f"))
-            print()
+    # Genera tabelle
+    for metric in metrics_to_run:
+        print(f"\n=== {metric.upper()} ===")
+        
+        if metric == "robustness":
+            df = build_robustness_table(args.sample)
+        elif metric == "contrastivity":
+            df = build_contrastivity_table(args.sample)
+        elif metric == "consistency":
+            df = build_consistency_table(args.sample)
+        
+        # Output
+        if args.csv:
+            filename = f"{metric}_table.csv"
+            df.to_csv(filename)
+            print(f"Salvato: {filename}")
         else:
-            csv_name = f"{met}_table.csv"
-            df.to_csv(csv_name, float_format="%.4f")
-            print(f"Salvato {csv_name}")
-
+            print(df.to_markdown(floatfmt=".4f"))
 
 if __name__ == "__main__":
     main()

@@ -1,60 +1,43 @@
 """
-utils.py – Utility comuni per il progetto XAI Benchmark
-======================================================
+utils.py – Utility semplici per il progetto XAI Benchmark
+========================================================
 
-File pensato per raccogliere **piccole funzioni riusabili** senza dipendenze
-pesanti, in modo da non ripetere codice in più script.
+Funzioni base riusabili senza troppa complessità.
 
-Funzionalità principali
------------------------
-1. **set_seed(seed)** – fissa seed per *random*, *numpy*, *torch* (+ CUDA).
-2. **chunk_iter(iterable, size)** – genera mini‑batch di grandezza fissa.
-3. **save_json(path, obj) / load_json(path)** – lettura/scrittura JSON semplice
-   (gestisce *Path* o stringa). Usa indent=2 per leggere comodamente i file.
-4. **tqdm_wrapper(dataloader)** – progress bar già configurata per loop su
-   *torch.utils.data.DataLoader*.
-
-
+Funzionalità:
+1. set_seed() - fissa seed per riproducibilità
+2. chunk_iter() - divide lista in pezzi
+3. save_json/load_json() - salva/carica JSON
+4. tqdm_wrapper() - progress bar per DataLoader
+5. format_time() - formatta secondi in h/m/s
+6. check_gpu() - info base GPU
 """
-
-from __future__ import annotations
 
 import json
 import random
+import time
 from pathlib import Path
-from typing import Any, Iterable, Iterator, List, Sequence, TypeVar
+from typing import Any, Iterable, Iterator, List, TypeVar
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-__all__: List[str] = [
-    "set_seed",
-    "chunk_iter",
-    "save_json",
-    "load_json",
-    "tqdm_wrapper",
-]
-
 T = TypeVar("T")
 
-# ==== 1. Reproducibilità globale ====
-
+# ==== 1. Seed per riproducibilità ====
 def set_seed(seed: int) -> None:
-    """Fissa tutti i generatori di random per garantire esperimenti riproducibili."""
+    """Fissa seed per riproducibilità."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-
-# ==== 2. Suddivisione iterabile ====
-
+# ==== 2. Divide lista in chunk ====
 def chunk_iter(iterable: Iterable[T], size: int) -> Iterator[List[T]]:
-    """Divide un iterabile in liste di lunghezza `size` (ultima più corta)."""
-    chunk: List[T] = []
+    """Divide un iterabile in liste di lunghezza size."""
+    chunk = []
     for item in iterable:
         chunk.append(item)
         if len(chunk) == size:
@@ -63,30 +46,69 @@ def chunk_iter(iterable: Iterable[T], size: int) -> Iterator[List[T]]:
     if chunk:
         yield chunk
 
+# ==== 3. JSON semplice ====
+def save_json(path: str, obj: Any) -> None:
+    """Salva oggetto in JSON."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
 
-# ==== 3. I/O JSON semplificato ====
-
-def _as_path(path: str | Path) -> Path:
-    return path if isinstance(path, Path) else Path(path)
-
-
-def save_json(path: str | Path, obj: Any) -> None:
-    """Salva `obj` (serializzabile JSON) su disco con indentazione leggibile."""
-    p = _as_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-def load_json(path: str | Path) -> Any:
-    """Carica un oggetto da file JSON."""
-    p = _as_path(path)
-    with p.open("r", encoding="utf-8") as f:
+def load_json(path: str) -> Any:
+    """Carica oggetto da JSON."""
+    with open(path, "r") as f:
         return json.load(f)
 
+# ==== 4. Progress bar ====
+def tqdm_wrapper(dataloader, desc: str = "Progress"):
+    """Progress bar per DataLoader."""
+    return tqdm(dataloader, desc=desc, leave=False)
 
-# ==== 4. Progress bar DataLoader ====
+# ==== 5. Formatta tempo ====
+def format_time(seconds: float) -> str:
+    """Formatta secondi in formato leggibile."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds//60:.0f}m {seconds%60:.0f}s"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h:.0f}h {m:.0f}m"
 
-def tqdm_wrapper(dataloader: torch.utils.data.DataLoader, desc: str | None = None):
-    """Ritorna un `tqdm` configurato per iterare sul dataloader."""
-    return tqdm(dataloader, total=len(dataloader), desc=desc or "Batches", leave=False)
+# ==== 6. Info GPU base ====
+def check_gpu() -> dict:
+    """Info base su GPU."""
+    if not torch.cuda.is_available():
+        return {"available": False}
+    
+    return {
+        "available": True,
+        "count": torch.cuda.device_count(),
+        "current": torch.cuda.current_device(),
+        "name": torch.cuda.get_device_name(),
+    }
+
+# ==== 7. Context manager per timing ====
+class Timer:
+    """Misura tempo di esecuzione."""
+    def __init__(self, name: str = "Operazione"):
+        self.name = name
+        self.start = None
+    
+    def __enter__(self):
+        self.start = time.time()
+        print(f"Inizio: {self.name}")
+        return self
+    
+    def __exit__(self, *args):
+        duration = time.time() - self.start
+        print(f"Completato: {self.name} in {format_time(duration)}")
+
+if __name__ == "__main__":
+    # Test rapido
+    set_seed(42)
+    print("GPU:", check_gpu())
+    print("Tempo:", format_time(3661))
+    
+    with Timer("Test"):
+        time.sleep(0.1)
