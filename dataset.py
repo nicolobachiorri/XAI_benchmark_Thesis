@@ -4,9 +4,8 @@ Simple IMDB Sentiment Dataset Preparation (columns: text, label)
 
 """
 
-# ==== 1. Librerie ====
+# Rimuovi l'import di train_test_split
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -81,15 +80,7 @@ for df_name, df in [("Train", train_df), ("Test", test_df)]:
 train_df = train_df.reset_index(drop=True)
 test_df = test_df.reset_index(drop=True)
 
-# Suddivisione train/validation 90‑10 stratificata
-train_df, val_df = train_test_split(
-    train_df,
-    test_size=0.1,
-    random_state=RANDOM_STATE,
-    stratify=train_df["label"],
-)
-
-print(f"Split completato: Training {len(train_df)}, Validation {len(val_df)}, Test {len(test_df)}")
+print(f"Dataset pronto: Training {len(train_df)}, Test {len(test_df)}")
 
 # ==== 5. Tokenizzazione Flessibile ====
 def get_tokenizer_for_model(model_name: str):
@@ -158,7 +149,7 @@ class IMDBDataset(Dataset):
 # ==== 7. Factory Functions per DataLoader ====
 def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
     """
-    Crea DataLoader ottimizzati per un modello specifico.
+    Crea DataLoader per un modello specifico.
     
     Args:
         model_name: Nome del modello per scegliere il tokenizer appropriato
@@ -166,7 +157,7 @@ def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LE
         max_length: Lunghezza massima sequenze
     
     Returns:
-        tuple: (train_loader, val_loader, test_loader)
+        tuple: (train_loader, test_loader)
     """
     # Carica tokenizer appropriato
     if model_name:
@@ -176,21 +167,18 @@ def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LE
     
     # Crea datasets
     train_dataset = IMDBDataset(train_df, tokenizer, max_length)
-    val_dataset = IMDBDataset(val_df, tokenizer, max_length) 
     test_dataset = IMDBDataset(test_df, tokenizer, max_length)
     
     # Crea dataloaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    return train_loader, val_loader, test_loader
+    return train_loader, test_loader
 
 # ==== 8. DataLoader Default (mantenuto per compatibilità) ====
 # Usa tokenizer generico per compatibilità con codice esistente
 default_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 train_loader = DataLoader(IMDBDataset(train_df, default_tokenizer), batch_size=BATCH_SIZE, shuffle=True)
-val_loader   = DataLoader(IMDBDataset(val_df, default_tokenizer),   batch_size=BATCH_SIZE, shuffle=False)
 test_loader  = DataLoader(IMDBDataset(test_df, default_tokenizer),  batch_size=BATCH_SIZE, shuffle=False)
 
 # ==== 9. Sanity Check ====
@@ -211,7 +199,7 @@ if __name__ == "__main__":
     for model_name in test_models:
         try:
             print(f"\nTest con {model_name}:")
-            train_dl, val_dl, test_dl = create_dataloaders(model_name, batch_size=4)
+            train_dl, test_dl = create_dataloaders(model_name, batch_size=4)
             batch = next(iter(train_dl))
             print(f"Batch shapes: {[f'{k}: {v.shape}' for k, v in batch.items()]}")
         except Exception as e:
