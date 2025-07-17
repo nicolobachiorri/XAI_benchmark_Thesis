@@ -17,7 +17,7 @@ MODELS: Dict[str, str] = {
     "roberta-large":    "siebert/sentiment-roberta-large-english", 
     "bert-large":       "assemblyai/bert-large-uncased-sst2",
     "roberta-base":     "AnkitAI/reviews-roberta-base-sentiment-analysis",
-    "bert-base":        "Asteroid-Destroyer/bert-amazon-sentiment",
+   # "bert-base":        "Asteroid-Destroyer/bert-amazon-sentiment",
     "tinybert":         "Harsha901/tinybert-imdb-sentiment-analysis-model",
 }
 
