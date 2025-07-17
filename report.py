@@ -24,7 +24,7 @@ import metrics
 from utils import set_seed, Timer
 
 # Configurazione
-EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow", "lrp"]
+EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "lrp"]
 METRICS = ["robustness", "contrastivity", "consistency"]
 
 set_seed(42)
