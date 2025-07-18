@@ -374,7 +374,7 @@ def _attention_flow(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 4. LIME-Text (già funzionante)
+### LIME
 
 def _lime_text(model, tokenizer):
     if not LIME_AVAILABLE:
@@ -384,7 +384,11 @@ def _lime_text(model, tokenizer):
 
     def predict(texts):
         try:
-            encoded = tokenizer(
+            if isinstance(texts, str):
+                texts = [texts]
+            texts = [str(t) for t in texts]  # Assicura che siano stringhe pure
+            
+            encoded = tokenizer.batch_encode_plus(
                 texts,
                 return_tensors="pt",
                 padding=True,
@@ -396,7 +400,8 @@ def _lime_text(model, tokenizer):
                 logits = outputs.logits
                 probs = F.softmax(logits, dim=-1)
             return probs.cpu().numpy()
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] LIME predict error: {e}")
             return np.array([[0.5, 0.5] for _ in texts])
 
     def explain(text: str) -> Attribution:
@@ -409,11 +414,11 @@ def _lime_text(model, tokenizer):
                 num_samples=100
             )
             features = exp.as_list()
-            if features:
+            try:
                 tokens, scores = zip(*features)
                 log_timing("lime", time.time() - start_time)
                 return Attribution(list(tokens), list(scores))
-            else:
+            except:
                 words = text.split()[:10]
                 log_timing("lime", time.time() - start_time)
                 return Attribution(words, [0.0] * len(words))
