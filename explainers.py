@@ -118,6 +118,12 @@ def _safe_tokenize(text: str, tokenizer, max_length=MAX_LEN):
         max_length=max_length,
         padding='max_length'
     )
+
+    for key in encoded:
+        if hasattr(encoded[key], 'to'):
+            encoded[key] = encoded[key].to(models.DEVICE)
+    
+    return encoded
     
     return encoded
 
@@ -136,6 +142,9 @@ class Attribution:
         if len(self.tokens) > 5:
             items.append("...")
         return "Attribution(" + ", ".join(items) + ")"
+
+
+
 
 # -------------------------------------------------------------------------
 # 1. GRADIENT × INPUT (già funzionante)
