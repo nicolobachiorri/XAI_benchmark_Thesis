@@ -573,8 +573,7 @@ def _kernel_shap(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 6. LRP (con fallback robusto)
-
+# 6. LRP 
 def _lrp(model, tokenizer):
     if not CAPTUM_AVAILABLE:
         raise ImportError("Captum non installato per LRP")
@@ -582,65 +581,48 @@ def _lrp(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
         try:
-            # Prova LRP standard
-            try:
-                base_model = _get_base_model(model)
-                if hasattr(base_model, 'encoder') and hasattr(base_model.encoder, 'layer'):
-                    target_layer = base_model.encoder.layer[-1]
-                else:
-                    target_layer = base_model
-                
-                lrp = LayerLRP(model, target_layer)
-                
-                enc = _safe_tokenize(text, tokenizer, MAX_LEN)
-                ids, attn = enc["input_ids"], enc["attention_mask"]
-                
-                attrs = lrp.attribute(ids, additional_forward_args=(attn,))
-                scores = attrs.sum(dim=-1).squeeze(0)
-                tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
-                log_timing("lrp", time.time() - start_time)
-                return Attribution(tokens, scores.tolist())
-                
-            except Exception as lrp_error:
-                print(f"LRP failed, using gradient fallback: {lrp_error}")
-                
-                # FALLBACK: Gradient semplice (simile a grad_input ma più semplice)
-                model.eval()
-                enc = _safe_tokenize(text, tokenizer, min(MAX_LEN, 128))
-                ids, attn = enc["input_ids"], enc["attention_mask"]
-                ids.requires_grad_(True)
-                
-                outputs = model(input_ids=ids, attention_mask=attn)
-                logits = outputs.logits
-                
-                # Score basato su gradient rispetto agli input_ids
-                if logits.size(-1) > 1:
-                    target = logits[:, 1].sum()
-                else:
-                    target = logits.sum()
-                
-                model.zero_grad()
-                target.backward()
-                
-                if ids.grad is not None:
-                    scores = ids.grad.abs().sum(dim=0)
-                else:
-                    scores = torch.ones(ids.size(-1)) * 0.1
-                
-                tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
-                log_timing("lrp", time.time() - start_time)
-                return Attribution(tokens, scores.tolist())
-                
+            # Tokenizzazione
+            enc = _safe_tokenize(text, tokenizer, MAX_LEN)
+            ids = enc["input_ids"]         # shape: [1, seq_len]
+            attn = enc["attention_mask"]   # shape: [1, seq_len]
+
+            # Ottieni gli embeddings (float tensor)
+            embed_layer = _get_embedding_layer(model)
+            embeds = embed_layer(ids)      # shape: [1, seq_len, hidden_dim]
+
+            # Trova un layer compatibile come target
+            base_model = _get_base_model(model)
+            if hasattr(base_model, 'encoder') and hasattr(base_model.encoder, 'layer'):
+                target_layer = base_model.encoder.layer[-1]
+            else:
+                target_layer = base_model
+
+            # Crea il modulo LRP e calcola le attribution
+            lrp = LayerLRP(model, target_layer)
+            attributions = lrp.attribute(
+                inputs=embeds,
+                additional_forward_args=(None, attn)
+            )
+            scores = attributions.sum(dim=-1).squeeze(0)  # shape: [seq_len]
+
+            # Decodifica i token
+            tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
+            log_timing("lrp", time.time() - start_time)
+            return Attribution(tokens, scores.tolist())
+
         except Exception as e:
             print(f"Errore in LRP: {e}")
-            # Ultimo fallback: importanza basata su posizione
-            tokens = tokenizer.convert_ids_to_tokens(
-                tokenizer.encode(text, max_length=10, truncation=True)
-            )
-            scores = [max(0.1, 1.0 / (i + 1)) for i in range(len(tokens))]
+            try:
+                tokens = tokenizer.convert_ids_to_tokens(
+                    tokenizer.encode(text, max_length=10, truncation=True)
+                )
+                scores = [0.0] * len(tokens)
+            except:
+                tokens = text.split()[:10]
+                scores = [0.0] * len(tokens)
             log_timing("lrp", time.time() - start_time)
             return Attribution(tokens, scores)
-    
+
     return explain
 
 # -------------------------------------------------------------------------
