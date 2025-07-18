@@ -586,33 +586,39 @@ def _lrp(model, tokenizer):
             ids = enc["input_ids"]
             attn = enc["attention_mask"]
 
-            # Ottieni gli embeddings (evitiamo input_ids)
+            # Ottieni gli embeddings
             embed_layer = _get_embedding_layer(model)
             embeds = embed_layer(ids)  # [1, seq_len, hidden_dim]
 
-            # Trova il layer target (ultimo blocco encoder)
+            # Target layer (es. ultimo blocco encoder)
             base_model = _get_base_model(model)
             if hasattr(base_model, 'encoder') and hasattr(base_model.encoder, 'layer'):
                 target_layer = base_model.encoder.layer[-1]
             else:
                 target_layer = base_model
 
-            # Funzione forward custom, per evitare di toccare input_ids
-            def custom_forward(inputs_embeds, attention_mask):
-                output = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-                return output.logits
+            # Wrapper nn.Module compatibile con Captum
+            class EmbeddingForwardWrapper(torch.nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
 
-            # LRP sul wrapper, non sul modello intero!
-            lrp = LayerLRP(custom_forward, target_layer)
+                def forward(self, inputs_embeds, attention_mask):
+                    return self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
 
-            # Calcola le attribution su embeddings
+            wrapped_model = EmbeddingForwardWrapper(model)
+
+            # Inizializza LayerLRP con modello wrappato
+            lrp = LayerLRP(wrapped_model, target_layer)
+
+            # Calcola le attribution
             attributions = lrp.attribute(
                 inputs=embeds,
                 additional_forward_args=attn
             )
             scores = attributions.sum(dim=-1).squeeze(0)
 
-            # Converti token
+            # Token → testo
             tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
             log_timing("lrp", time.time() - start_time)
             return Attribution(tokens, scores.tolist())
@@ -623,7 +629,6 @@ def _lrp(model, tokenizer):
             scores = [0.0] * len(tokens)
             log_timing("lrp", time.time() - start_time)
             return Attribution(tokens, scores)
-
 
     return explain
 
