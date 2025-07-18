@@ -103,14 +103,6 @@ def load_model(model_key: str, num_labels: int = 2):
         print(f"Errore caricamento modello {model_key}: {e}")
         raise
 
-def move_batch_to_device(batch):
-    """Sposta un batch di dati sul device corretto."""
-    if isinstance(batch, dict):
-        return {k: v.to(DEVICE) if hasattr(v, 'to') else v for k, v in batch.items()}
-    elif hasattr(batch, 'to'):
-        return batch.to(DEVICE)
-    else:
-        return batch
 
 def move_batch_to_device(batch):
     """Sposta un batch di dati sul device corretto."""

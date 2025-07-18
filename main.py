@@ -58,6 +58,9 @@ def cmd_explain(args):
             padding=True,
             max_length=512
         )
+        
+        # FIX: Sposta input su GPU
+        inputs = models.move_batch_to_device(inputs)
 
         with torch.no_grad():
             outputs = model(**inputs)
@@ -85,7 +88,6 @@ def cmd_explain(args):
     except Exception as e:
         print(f"Errore: {e}")
         sys.exit(1)
-
 def get_test_data(sample_size: Optional[int] = None) -> tuple:
     """Carica dati di test con campionamento stratificato."""
     texts = dataset.test_df["text"].tolist()

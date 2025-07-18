@@ -40,6 +40,11 @@ DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 def _get_positive_prob(model: PreTrainedModel, input_ids: torch.Tensor, attn_mask: torch.Tensor) -> float:
     """Calcola la probabilità della classe positiva in modo robusto."""
     try:
+        # FIX: Assicura che input siano su GPU
+        import models
+        input_ids = input_ids.to(models.DEVICE)
+        attn_mask = attn_mask.to(models.DEVICE)
+        
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attn_mask)
             logits = outputs.logits
@@ -54,7 +59,7 @@ def _get_positive_prob(model: PreTrainedModel, input_ids: torch.Tensor, attn_mas
     except Exception as e:
         print(f"Errore in _get_positive_prob: {e}")
         return 0.5  # Fallback: probabilità neutra
-
+    
 # ==== 4. Funzioni di perturbazione ====
 
 def _random_mask(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO, mask_token: str = "[MASK]") -> str:
