@@ -50,8 +50,15 @@ def cmd_explain(args):
         tokenizer = models.load_tokenizer(args.model)
         explainer = explainers.get_explainer(args.explainer, model, tokenizer)
         
-        # Predizione modello
-        inputs = models.tokenize_input(args.text, model, tokenizer)
+        # Calcola la predizione del modello
+        inputs = tokenizer(
+            args.text,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=512
+        )
+
         with torch.no_grad():
             outputs = model(**inputs)
             logits = outputs.logits
