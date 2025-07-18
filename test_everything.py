@@ -1,14 +1,20 @@
 """
-test_everything.py - Test completi e progressivi
-==============================================
+test_everything.py - Test completi e progressivi AGGIORNATO
+=========================================================
 
 Sequenza di test per verificare che tutto funzioni prima del report completo:
 
 1. Test modelli (caricamento)
-2. Test explainer (creazione + spiegazione singola)
-3. Test metriche (calcolo su dati minimi)
+2. Test explainer (creazione + spiegazione singola) - AGGIORNATO
+3. Test metriche (calcolo su dati minimi) - AGGIORNATO per consistency fix
 4. Test report mini (tutto insieme)
 5. Test report piccolo (con più dati)
+
+AGGIORNAMENTI:
+- Consistency ora usa inference seed invece di modelli diversi
+- Test explainer aggiornati per nuovi fix (shap, attention_flow)
+- Timing logs inclusi per debugging performance
+- Controlli dipendenze explainer
 
 Uso:
     python test_everything.py --level 1    # Solo test modelli
@@ -41,7 +47,7 @@ def test_level_1_models():
     results = {}
     
     for model_key in models.MODELS.keys():
-        print(f"\n[1/{len(models.MODELS)}] Testing {model_key}...")
+        print(f"\n[{len(results)+1}/{len(models.MODELS)}] Testing {model_key}...")
         try:
             start_time = time.time()
             
@@ -86,14 +92,25 @@ def test_level_1_models():
     return True
 
 def test_level_2_explainers():
-    """LEVEL 2: Test creazione explainer per ogni modello"""
+    """LEVEL 2: Test creazione explainer per ogni modello (AGGIORNATO)"""
     print("\n" + "=" * 60)
-    print("LEVEL 2: TEST EXPLAINER CREATION")
+    print("LEVEL 2: TEST EXPLAINER CREATION (UPDATED)")
     print("=" * 60)
+    
+    # Prima controlla dipendenze
+    print("\n--- Controllo Dipendenze ---")
+    deps = explainers.check_dependencies()
+    
+    # Lista explainer disponibili (dinamica basata su dipendenze)
+    available_explainers = explainers.list_explainers()
+    print(f"\nExplainer disponibili: {available_explainers}")
+    
+    if not available_explainers:
+        print("ERROR: Nessun explainer disponibile!")
+        return False
     
     # Usa modelli che dovrebbero funzionare
     test_models = ["distilbert", "tinybert"]  # Inizia con i più piccoli
-    test_explainers = explainers.list_explainers()
     test_text = "This movie is absolutely fantastic!"
     
     results = {}
@@ -112,7 +129,7 @@ def test_level_2_explainers():
             
             results[model_key] = {}
             
-            for explainer_name in test_explainers:
+            for explainer_name in available_explainers:
                 print(f"  Testing {explainer_name}...", end="")
                 try:
                     start_time = time.time()
@@ -172,17 +189,46 @@ def test_level_2_explainers():
     print(f"Successful: {success_tests}/{total_tests}")
     print(f"Failed: {total_tests - success_tests}/{total_tests}")
     
+    # Performance summary
+    if success_tests > 0:
+        print("\nPerformance ranking:")
+        all_times = []
+        for model_key, model_results in results.items():
+            if "model_error" in model_results:
+                continue
+            for explainer_name, result in model_results.items():
+                if result.get("status") == "OK":
+                    all_times.append((explainer_name, result["time"]))
+        
+        if all_times:
+            # Media per explainer
+            explainer_times = {}
+            for explainer, time_val in all_times:
+                if explainer not in explainer_times:
+                    explainer_times[explainer] = []
+                explainer_times[explainer].append(time_val)
+            
+            avg_times = {exp: sum(times)/len(times) for exp, times in explainer_times.items()}
+            sorted_times = sorted(avg_times.items(), key=lambda x: x[1])
+            
+            for i, (explainer, avg_time) in enumerate(sorted_times[:5]):
+                print(f"  {i+1}. {explainer}: {avg_time:.2f}s avg")
+    
     return success_tests > 0
 
 def test_level_3_metrics():
-    """LEVEL 3: Test calcolo metriche con dati minimi"""
+    """LEVEL 3: Test calcolo metriche con dati minimi (AGGIORNATO per consistency)"""
     print("\n" + "=" * 60)
-    print("LEVEL 3: TEST METRICS CALCULATION")
+    print("LEVEL 3: TEST METRICS CALCULATION (UPDATED)")
     print("=" * 60)
     
     # Usa combinazione che dovrebbe funzionare
     model_key = "distilbert"
-    explainer_name = "lime"  # LIME è di solito il più stabile
+    
+    # Prova prima con lime (più stabile), poi con altri se disponibili
+    available_explainers = explainers.list_explainers()
+    explainer_name = "lime" if "lime" in available_explainers else available_explainers[0]
+    
     test_texts = [
         "This movie is great!",
         "This movie is terrible.",
@@ -204,7 +250,7 @@ def test_level_3_metrics():
         try:
             start_time = time.time()
             score = metrics.evaluate_robustness_over_dataset(
-                model, tokenizer, explainer, test_texts[:2]  # Solo 2 esempi
+                model, tokenizer, explainer, test_texts[:2], show_progress=False
             )
             exec_time = time.time() - start_time
             print(f"Robustness: {score:.4f} ({exec_time:.1f}s)")
@@ -227,17 +273,19 @@ def test_level_3_metrics():
             print(f"Contrastivity failed: {e}")
             results["contrastivity"] = {"status": "FAILED", "error": str(e)}
         
-        # Test Consistency (2 modelli)
-        print("\nTesting Consistency...")
+        # Test Consistency (AGGIORNATO: ora usa inference seed)
+        print("\nTesting Consistency (con inference seed)...")
         try:
             start_time = time.time()
-            model2 = models.load_model("tinybert")  # Modello diverso
-            tokenizer2 = models.load_tokenizer("tinybert")
-            explainer2 = explainers.get_explainer(explainer_name, model2, tokenizer2)
+            seeds = [42, 123]  # Solo 2 seed per test veloce
             
             score = metrics.evaluate_consistency_over_dataset(
-                model, model2, tokenizer, tokenizer2, 
-                explainer, explainer2, test_texts[:2]
+                model=model,
+                tokenizer=tokenizer,
+                explainer=explainer,
+                texts=test_texts[:2],  # Solo 2 testi
+                seeds=seeds,
+                show_progress=False
             )
             exec_time = time.time() - start_time
             print(f"Consistency: {score:.4f} ({exec_time:.1f}s)")
@@ -252,6 +300,12 @@ def test_level_3_metrics():
         success_count = sum(1 for r in results.values() if r["status"] == "OK")
         print(f"Successful metrics: {success_count}/{len(results)}")
         
+        for metric_name, result in results.items():
+            if result["status"] == "OK":
+                print(f"  ✓ {metric_name}: {result['score']:.4f} ({result['time']:.1f}s)")
+            else:
+                print(f"  ✗ {metric_name}: {result.get('error', 'Unknown error')}")
+        
         return success_count > 0
         
     except Exception as e:
@@ -265,10 +319,11 @@ def test_level_4_mini_report():
     print("LEVEL 4: TEST MINI REPORT")
     print("=" * 60)
     
-    # Configurazione minima
+    # Configurazione minima basata su explainer disponibili
     test_models = ["distilbert", "tinybert"]
-    test_explainers = ["lime", "grad_input"]
-    test_metrics = ["robustness"]
+    available_explainers = explainers.list_explainers()
+    test_explainers = available_explainers[:2] if len(available_explainers) >= 2 else available_explainers
+    test_metrics = ["robustness"]  # Metric più veloce per test
     sample_size = 2
     
     print(f"Configuration:")
@@ -276,6 +331,10 @@ def test_level_4_mini_report():
     print(f"  Explainers: {test_explainers}")
     print(f"  Metrics: {test_metrics}")
     print(f"  Sample size: {sample_size}")
+    
+    if not test_explainers:
+        print("ERROR: Nessun explainer disponibile per mini report!")
+        return False
     
     try:
         from collections import defaultdict
@@ -287,6 +346,9 @@ def test_level_4_mini_report():
         current_test = 0
         
         for model_key in test_models:
+            if model_key not in models.MODELS:
+                continue
+                
             for explainer_name in test_explainers:
                 for metric_name in test_metrics:
                     current_test += 1
@@ -304,12 +366,21 @@ def test_level_4_mini_report():
                         start_time = time.time()
                         if metric_name == "robustness":
                             score = metrics.evaluate_robustness_over_dataset(
-                                model, tokenizer, explainer, test_texts
+                                model, tokenizer, explainer, test_texts, show_progress=False
                             )
                         elif metric_name == "contrastivity":
                             pos_attrs = [explainer(test_texts[0])]
                             neg_attrs = [explainer(test_texts[1])]
                             score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
+                        elif metric_name == "consistency":
+                            score = metrics.evaluate_consistency_over_dataset(
+                                model=model,
+                                tokenizer=tokenizer,
+                                explainer=explainer,
+                                texts=test_texts,
+                                seeds=[42, 123],
+                                show_progress=False
+                            )
                         else:
                             score = 0.5  # Placeholder
                         
@@ -353,7 +424,7 @@ def test_level_5_small_report():
             ["python", "report.py", "--sample", "3", "--csv"],
             capture_output=True,
             text=True,
-            timeout=300  # 5 minuti timeout
+            timeout=600  # 10 minuti timeout (aumentato per nuovi explainer)
         )
         
         if result.returncode == 0:
@@ -368,7 +439,7 @@ def test_level_5_small_report():
             return False
             
     except subprocess.TimeoutExpired:
-        print("Small report timed out (>5 minutes)")
+        print("Small report timed out (>10 minutes)")
         return False
     except Exception as e:
         print(f"Error running small report: {e}")
@@ -378,9 +449,16 @@ def main():
     parser = argparse.ArgumentParser(description="Test progressivi sistema XAI")
     parser.add_argument("--level", type=int, choices=[1,2,3,4,5], default=5, 
                        help="Livello di test da eseguire (1-5)")
+    parser.add_argument("--debug-timing", action="store_true", 
+                       help="Abilita debug timing negli explainer")
     args = parser.parse_args()
     
-    print(f"TESTING XAI BENCHMARK SYSTEM")
+    # Configura debug timing se richiesto
+    if args.debug_timing:
+        explainers.DEBUG_TIMING = True
+        print("Debug timing abilitato per explainer")
+    
+    print(f"TESTING XAI BENCHMARK SYSTEM (UPDATED)")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Test level: {args.level}")
     
@@ -426,10 +504,18 @@ def main():
     print(f"Failed: {min(args.level, len(tests)) - passed_tests}")
     
     if passed_tests == min(args.level, len(tests)):
-        print("\nALL TESTS PASSED! System is ready for full report")
+        print("\n ALL TESTS PASSED! System is ready for full report")
         print("You can now run: python report.py --sample 500 --csv")
+        print("\nSUGGESTED NEXT STEPS:")
+        print("1. python main.py explain --model distilbert --explainer shap --text 'Great movie!'")
+        print("2. python main.py evaluate --metric robustness --model distilbert --explainer lime --sample 10")
+        print("3. python report.py --sample 50 --csv")
     else:
-        print(f"\nSome tests failed. Fix issues before running full report.")
+        print(f"\n Some tests failed. Fix issues before running full report.")
+        print("\nDEBUG SUGGESTIONS:")
+        print("1. Check dependencies: python -c 'import explainers; explainers.check_dependencies()'")
+        print("2. Test individual explainer: python explainers.py")
+        print("3. Run with timing debug: python test_everything.py --debug-timing")
     
     return passed_tests == min(args.level, len(tests))
 
