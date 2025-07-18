@@ -57,7 +57,10 @@ def cmd_explain(args):
         # Mostra risultati
         print("\nImportanza token:")
         for token, score in zip(attr.tokens, attr.scores):
-            print(f"{token:>15} {score:+.3f}")
+            # Solo token "parole"
+            if token.isalpha():
+                print(f"{token:>15} {score:+.3f}")
+
             
     except Exception as e:
         print(f"Errore: {e}")
@@ -327,4 +330,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
