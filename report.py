@@ -5,7 +5,10 @@ report.py – Genera tabelle per le metriche XAI (AGGIORNATO)
 Crea tabelle con risultati di Robustness, Consistency e Contrastivity
 per tutti i modelli e explainer.
 
-AGGIORNAMENTO: Consistency ora usa inference seed invece di modelli diversi.
+AGGIORNAMENTO: 
+- Consistency ora usa inference seed invece di modelli diversi
+- Aggiunto attention_flow tra gli explainer disponibili
+- Fix syntax error con global declaration
 
 Uso:
     python report.py                    # Tutte le metriche, 500 esempi
@@ -25,9 +28,11 @@ import explainers
 import metrics
 from utils import set_seed, Timer
 
-# Configurazione
-EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "lrp"]
+# Configurazione GLOBALE
+EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow", "lrp"]
 METRICS = ["robustness", "contrastivity", "consistency"]
+
+# Variabile globale per consistency seeds (dichiarata all'inizio)
 DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 
 set_seed(42)
@@ -125,8 +130,12 @@ def eval_contrastivity(model_key, explainer_name, sample_size):
         print(f"    Error: {e}")
         return float('nan')
 
-def eval_consistency(model_key, explainer_name, sample_size, seeds=DEFAULT_CONSISTENCY_SEEDS):
+def eval_consistency(model_key, explainer_name, sample_size, seeds=None):
     """Valuta consistency con inference seed approach."""
+    global DEFAULT_CONSISTENCY_SEEDS
+    if seeds is None:
+        seeds = DEFAULT_CONSISTENCY_SEEDS
+        
     print(f"  Computing consistency for {model_key} + {explainer_name}")
     
     try:
@@ -157,7 +166,11 @@ def build_robustness_table(sample_size):
     print("Calcolando robustness...")
     results = defaultdict(dict)
     
-    for explainer in EXPLAINERS:
+    # Filtra explainer disponibili
+    available_explainers = [exp for exp in EXPLAINERS if exp in explainers.list_explainers()]
+    print(f"Explainer disponibili: {available_explainers}")
+    
+    for explainer in available_explainers:
         for model_key in models.MODELS.keys():
             try:
                 with Timer(f"{explainer} + {model_key}"):
@@ -174,7 +187,11 @@ def build_contrastivity_table(sample_size):
     print("Calcolando contrastivity...")
     results = defaultdict(dict)
     
-    for explainer in EXPLAINERS:
+    # Filtra explainer disponibili
+    available_explainers = [exp for exp in EXPLAINERS if exp in explainers.list_explainers()]
+    print(f"Explainer disponibili: {available_explainers}")
+    
+    for explainer in available_explainers:
         for model_key in models.MODELS.keys():
             try:
                 with Timer(f"{explainer} + {model_key}"):
@@ -186,16 +203,25 @@ def build_contrastivity_table(sample_size):
     
     return pd.DataFrame(results).T
 
-def build_consistency_table(sample_size):
+def build_consistency_table(sample_size, seeds=None):
     """Tabella consistency: explainer x modelli (con inference seed)."""
+    global DEFAULT_CONSISTENCY_SEEDS
+    if seeds is None:
+        seeds = DEFAULT_CONSISTENCY_SEEDS
+        
     print("Calcolando consistency con inference seed...")
+    print(f"Usando seeds: {seeds}")
     results = defaultdict(dict)
     
-    for explainer in EXPLAINERS:
+    # Filtra explainer disponibili
+    available_explainers = [exp for exp in EXPLAINERS if exp in explainers.list_explainers()]
+    print(f"Explainer disponibili: {available_explainers}")
+    
+    for explainer in available_explainers:
         for model_key in models.MODELS.keys():
             try:
                 with Timer(f"{explainer} + {model_key}"):
-                    score = eval_consistency(model_key, explainer, sample_size)
+                    score = eval_consistency(model_key, explainer, sample_size, seeds)
                 results[explainer][model_key] = score
             except Exception as e:
                 print(f"Errore {explainer}+{model_key}: {e}")
@@ -246,26 +272,44 @@ def print_table_summary(df, metric_name):
         print(f"  {i+1}. {explainer} + {model}: {value:.4f}")
 
 def main():
+    global DEFAULT_CONSISTENCY_SEEDS
+    
     parser = argparse.ArgumentParser(description="Genera tabelle XAI")
     parser.add_argument("--metric", choices=METRICS + ["all"], default="all")
     parser.add_argument("--sample", type=int, default=500)
     parser.add_argument("--csv", action="store_true", help="Output CSV")
-    parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_CONSISTENCY_SEEDS,
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
                        help="Seed per consistency (default: 42 123 456 789)")
     args = parser.parse_args()
 
     print(f"Generando tabelle con {args.sample} esempi...")
-    print(f"Seed per consistency: {args.seeds}")
+    
+    # Aggiorna seed per consistency se forniti
+    if args.seeds:
+        DEFAULT_CONSISTENCY_SEEDS = args.seeds
+        print(f"Seed per consistency aggiornati: {DEFAULT_CONSISTENCY_SEEDS}")
+    else:
+        print(f"Seed per consistency (default): {DEFAULT_CONSISTENCY_SEEDS}")
+    
+    # Controlla explainer disponibili
+    available_explainers = explainers.list_explainers()
+    configured_explainers = [exp for exp in EXPLAINERS if exp in available_explainers]
+    missing_explainers = [exp for exp in EXPLAINERS if exp not in available_explainers]
+    
+    print(f"\nExplainer configurati: {EXPLAINERS}")
+    print(f"Explainer disponibili: {configured_explainers}")
+    if missing_explainers:
+        print(f"Explainer non disponibili (dipendenze mancanti): {missing_explainers}")
+    
+    if not configured_explainers:
+        print("ERRORE: Nessun explainer disponibile! Verificare installazione dipendenze.")
+        return
     
     # Scegli metriche
     if args.metric == "all":
         metrics_to_run = METRICS
     else:
         metrics_to_run = [args.metric]
-
-    # Aggiorna seed globali per consistency
-    global DEFAULT_CONSISTENCY_SEEDS
-    DEFAULT_CONSISTENCY_SEEDS = args.seeds
 
     # Genera tabelle
     for metric in metrics_to_run:
@@ -278,7 +322,7 @@ def main():
         elif metric == "contrastivity":
             df = build_contrastivity_table(args.sample)
         elif metric == "consistency":
-            df = build_consistency_table(args.sample)
+            df = build_consistency_table(args.sample, args.seeds)
         
         # Output
         if args.csv:
