@@ -25,7 +25,7 @@ python main.py explain --model distilbert --explainer lime --text "Great movie!"
 import argparse
 import sys
 from typing import List, Optional
-
+import torch
 import models
 import dataset
 import explainers
@@ -50,9 +50,22 @@ def cmd_explain(args):
         tokenizer = models.load_tokenizer(args.model)
         explainer = explainers.get_explainer(args.explainer, model, tokenizer)
         
+        # Predizione modello
+        inputs = models.tokenize_input(args.text, model, tokenizer)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1).squeeze()
+            pred_label = torch.argmax(probs).item()
+            pred_score = probs[pred_label].item()
+            label_name = "positive" if pred_label == 1 else "negative"
+
+        print(f"\nClassificazione modello: {label_name} ({pred_score:.3f})")
+
         # Genera spiegazione
         with Timer("Spiegazione"):
             attr = explainer(args.text)
+
         
         # Mostra risultati
         print("\nImportanza token:")
