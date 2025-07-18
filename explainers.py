@@ -426,206 +426,138 @@ def _lime_text(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 5. SHAP KernelExplainer - VERSIONE COMPLETAMENTE RISCRITTA
+# 5. SHAP - VERSIONE SEMPLIFICATA CHE FUNZIONA
 
 def _kernel_shap(model, tokenizer):
     if not SHAP_AVAILABLE:
         raise ImportError("SHAP non installato")
 
-    def predict_robust(texts):
-        """
-        Funzione predict ultra-robusta per SHAP.
-        Gestisce TUTTI i possibili casi edge.
-        """
+    def predict_simple(texts):
+        """Funzione predict ultra-semplice per SHAP."""
         try:
-            # Input validation e normalizzazione
-            if texts is None:
-                return np.array([[0.5, 0.5]])
-            
+            # Assicura che sia una lista
             if isinstance(texts, str):
                 texts = [texts]
             elif isinstance(texts, np.ndarray):
-                if texts.dtype.kind in {'U', 'S', 'a'}:  # String types
-                    texts = texts.tolist()
+                texts = texts.tolist()
+            
+            # Filtra testi vuoti
+            texts = [str(t) if t else "empty" for t in texts]
+            
+            # Tokenizzazione
+            encoded = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=128  # Ridotto per velocità
+            )
+            
+            # Inferenza
+            with torch.no_grad():
+                outputs = model(**encoded)
+                logits = outputs.logits
+                
+                # Gestione output
+                if logits.shape[-1] == 1:
+                    # Sigmoid per output singolo
+                    probs = torch.sigmoid(logits.squeeze(-1))
+                    return torch.stack([1 - probs, probs], dim=-1).cpu().numpy()
                 else:
-                    # Array numerico convertilo a testo
-                    texts = [str(x) for x in texts.flatten()]
-            elif not isinstance(texts, (list, tuple)):
-                texts = [str(texts)]
-            
-            # Filtra testi vuoti e conveti a stringhe
-            texts = [str(t) if t is not None else "empty" for t in texts]
-            texts = [t if t.strip() else "empty" for t in texts]
-            
-            if not texts:
-                return np.array([[0.5, 0.5]])
-            
-            # Tokenizzazione robusta
-            try:
-                encoded = tokenizer(
-                    texts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=min(MAX_LEN, 256),  # Limite più basso per SHAP
-                    return_attention_mask=True
-                )
-            except Exception as e:
-                print(f"Tokenization error in SHAP: {e}")
-                return np.array([[0.5, 0.5] for _ in texts])
-            
-            # Inferenza robusta
-            try:
-                with torch.no_grad():
-                    outputs = model(**encoded)
-                    logits = outputs.logits
-                    
-                    # Gestione dimensioni logits
-                    if logits.numel() == 0:
-                        return np.array([[0.5, 0.5] for _ in texts])
-                    
-                    # Forza a 2D se necessario
-                    if logits.dim() == 1:
-                        logits = logits.unsqueeze(0)
-                    
-                    # Gestisci diversi output del modello
-                    if logits.shape[-1] == 1:
-                        # Output singolo -> sigmoid
-                        probs = torch.sigmoid(logits.squeeze(-1))
-                        probs_2d = torch.stack([1 - probs, probs], dim=-1)
-                    elif logits.shape[-1] == 2:
-                        # Output doppio -> softmax
-                        probs_2d = F.softmax(logits, dim=-1)
-                    else:
-                        # Output multiplo -> prendi prime 2 colonne
-                        probs_2d = F.softmax(logits[:, :2], dim=-1)
-                    
-                    result = probs_2d.cpu().numpy()
-                    
-                    # Verifica finale dimensioni
-                    if result.shape[0] != len(texts):
-                        # Aggiusta numero righe
-                        if result.shape[0] == 1 and len(texts) > 1:
-                            result = np.tile(result, (len(texts), 1))
-                        else:
-                            result = result[:len(texts)]
-                    
-                    if result.shape[1] != 2:
-                        # Forza a 2 colonne
-                        col1 = result[:, 0] if result.shape[1] > 0 else np.full(len(texts), 0.5)
-                        result = np.column_stack([col1, 1 - col1])
-                    
-                    return result
-                    
-            except Exception as e:
-                print(f"Model inference error in SHAP: {e}")
-                return np.array([[0.5, 0.5] for _ in texts])
+                    # Softmax per output multiplo
+                    return F.softmax(logits, dim=-1).cpu().numpy()
                 
         except Exception as e:
-            print(f"Catch-all error in SHAP predict: {e}")
-            # Fallback assoluto
-            num_texts = 1
-            try:
-                if hasattr(texts, '__len__'):
-                    num_texts = len(texts)
-            except:
-                pass
+            print(f"Error in SHAP predict: {e}")
+            # Fallback
+            num_texts = len(texts) if hasattr(texts, '__len__') else 1
             return np.array([[0.5, 0.5] for _ in range(num_texts)])
-
-    # Crea explainer con configurazione minima
-    try:
-        # Test preliminare della funzione predict
-        test_result = predict_robust(["test"])
-        if test_result.shape != (1, 2):
-            raise ValueError(f"Predict test failed: {test_result.shape}")
-        
-        # Background ultra-semplice
-        background_data = [""]  # Stringa vuota come background
-        
-        # Configura SHAP con parametri conservativi
-        explainer = shap.KernelExplainer(
-            predict_robust, 
-            background_data,
-            link="identity"  # Evita trasformazioni che potrebbero causare problemi
-        )
-        
-        print("[DEBUG] SHAP explainer creato con successo")
-        
-    except Exception as e:
-        print(f"Errore creazione SHAP explainer: {e}")
-        
-        # Fallback: explainer dummy
-        class DummyExplainer:
-            def shap_values(self, texts, **kwargs):
-                if isinstance(texts, str):
-                    words = texts.split()
-                else:
-                    words = texts[0].split() if texts else ["dummy"]
-                return [np.zeros(len(words))]
-        
-        explainer = DummyExplainer()
 
     def explain(text: str) -> Attribution:
         start_time = time.time()
         try:
-            # Preprocessing del testo
+            # Prepara il testo
             text = text.strip()
             if not text:
                 text = "empty text"
             
-            # Limita lunghezza per performance
+            # APPROCCIO DIRETTO: usa solo le parole del testo
             words = text.split()
-            if len(words) > 20:  # OTTIMIZZAZIONE: max 20 parole per SHAP
-                text = " ".join(words[:20])
+            if len(words) > 15:  # Limita per performance
+                words = words[:15]
+                text = " ".join(words)
             
-            if hasattr(explainer, 'shap_values'):
-                try:
-                    # Calcolo SHAP con parametri conservativi
-                    shap_values = explainer.shap_values(
-                        [text], 
-                        nsamples=50,  # OTTIMIZZAZIONE: ridotto da 100
-                        silent=True,
-                        l1_reg="auto"  # Regolarizzazione automatica
-                    )
-                    
-                    # Estrazione scores robusta
-                    if isinstance(shap_values, list) and len(shap_values) > 0:
-                        # Prendi la prima classe (o la seconda se disponibile)
-                        scores_raw = shap_values[1] if len(shap_values) > 1 else shap_values[0]
-                        
-                        if hasattr(scores_raw, '__getitem__') and len(scores_raw) > 0:
-                            scores = scores_raw[0] if hasattr(scores_raw[0], '__len__') else scores_raw
-                        else:
-                            scores = scores_raw
-                    else:
-                        scores = shap_values
-                    
-                    # Conversione a lista
-                    if hasattr(scores, 'tolist'):
-                        scores = scores.tolist()
-                    elif not isinstance(scores, list):
-                        scores = [float(scores)] if np.isscalar(scores) else [0.0]
-                    
-                    # Allineamento con token
-                    tokens = text.split()
-                    min_len = min(len(tokens), len(scores))
-                    
-                    log_timing("shap", time.time() - start_time)
-                    return Attribution(tokens[:min_len], scores[:min_len])
-                    
-                except Exception as shap_error:
-                    print(f"SHAP calculation failed: {shap_error}")
-                    words = text.split()[:10]
-                    log_timing("shap", time.time() - start_time)
-                    return Attribution(words, [0.0] * len(words))
-            else:
-                # Dummy explainer
-                words = text.split()[:10]
-                log_timing("shap", time.time() - start_time)
-                return Attribution(words, [0.0] * len(words))
+            # Funzione per perturbare il testo
+            def mask_words(texts, mask_token="[MASK]"):
+                """Sostituisce parole con mask token per SHAP."""
+                if isinstance(texts, str):
+                    texts = [texts]
                 
+                results = []
+                for t in texts:
+                    words_t = t.split()
+                    # Sostituisci parole con mask
+                    masked = [mask_token if w == mask_token else w for w in words_t]
+                    results.append(" ".join(masked))
+                return results
+            
+            # Crea versione background (tutte le parole mascherate)
+            background_text = " ".join(["[MASK]"] * len(words))
+            
+            # Funzione predict per SHAP che gestisce perturbazioni
+            def predict_for_shap(word_presence):
+                """
+                word_presence: array di 0/1 che indica quali parole includere
+                """
+                try:
+                    if isinstance(word_presence, (list, tuple)):
+                        word_presence = np.array(word_presence)
+                    
+                    if word_presence.ndim == 1:
+                        word_presence = word_presence.reshape(1, -1)
+                    
+                    texts_to_predict = []
+                    for presence in word_presence:
+                        # Crea testo basato su presenza delle parole
+                        text_words = []
+                        for i, include in enumerate(presence):
+                            if i < len(words):
+                                if include > 0.5:  # Include la parola
+                                    text_words.append(words[i])
+                                else:  # Masking
+                                    text_words.append("[MASK]")
+                        
+                        if not text_words:
+                            text_words = ["[MASK]"]
+                        
+                        texts_to_predict.append(" ".join(text_words))
+                    
+                    return predict_simple(texts_to_predict)
+                    
+                except Exception as e:
+                    print(f"Error in predict_for_shap: {e}")
+                    batch_size = word_presence.shape[0] if hasattr(word_presence, 'shape') else 1
+                    return np.array([[0.5, 0.5] for _ in range(batch_size)])
+            
+            # Crea explainer con background semplice
+            background = np.zeros((1, len(words)))  # Tutte parole mascherate
+            explainer = shap.KernelExplainer(predict_for_shap, background)
+            
+            # Calcola SHAP values
+            instance = np.ones((1, len(words)))  # Tutte parole presenti
+            shap_values = explainer.shap_values(instance, nsamples=30, silent=True)
+            
+            # Estrai scores
+            if isinstance(shap_values, list):
+                scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
+            else:
+                scores = shap_values[0] if shap_values.ndim > 1 else shap_values
+            
+            log_timing("shap", time.time() - start_time)
+            return Attribution(words, scores.tolist())
+            
         except Exception as e:
-            print(f"Errore in SHAP explain: {e}")
+            print(f"Errore in SHAP: {e}")
             words = text.split()[:10]
             log_timing("shap", time.time() - start_time)
             return Attribution(words, [0.0] * len(words))
@@ -859,10 +791,10 @@ if __name__ == "__main__":
     print(f"\n2. EXPLAINER DISPONIBILI:")
     available = list_explainers()
     for explainer in available:
-        print(f"{explainer}")
+        print(f"  ✓ {explainer}")
     
     if not available:
-        print("Nessun explainer disponibile - verificare installazioni")
+        print("    Nessun explainer disponibile - verificare installazioni")
         exit(1)
     
     # 3. Test di caricamento
@@ -872,7 +804,7 @@ if __name__ == "__main__":
         print("  Caricando modello distilbert...")
         model = models.load_model("distilbert")
         tokenizer = models.load_tokenizer("distilbert")
-        print("Modello caricato")
+        print("  ✓ Modello caricato")
         
         # Test creazione explainer
         test_text = "This is a great test sentence for explainer testing!"
@@ -895,10 +827,10 @@ if __name__ == "__main__":
     
     print(f"\n{'='*60}")
     print("MIGLIORAMENTI IMPLEMENTATI:")
-    print("SHAP: Riscrittura completa predict function")
-    print("Attention Flow: Riattivato con ottimizzazioni performance")
-    print("Gestione errori granulare per tutti i metodi")
-    print("Fallback intelligenti per robustezza")
-    print("Timing logs per debugging performance")
-    print("Controlli dipendenze automatici")
+    print("  ✓ SHAP: Riscrittura completa predict function")
+    print("  ✓ Attention Flow: Riattivato con ottimizzazioni performance")
+    print("  ✓ Gestione errori granulare per tutti i metodi")
+    print("  ✓ Fallback intelligenti per robustezza")
+    print("  ✓ Timing logs per debugging performance")
+    print("  ✓ Controlli dipendenze automatici")
     print("=" * 60)
