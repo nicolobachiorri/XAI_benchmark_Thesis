@@ -581,52 +581,49 @@ def _lrp(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
         try:
-            # Tokenizzazione
+            # Tokenizza il testo
             enc = _safe_tokenize(text, tokenizer, MAX_LEN)
             ids = enc["input_ids"]
             attn = enc["attention_mask"]
 
-            # Ottieni gli embeddings
+            # Ottieni gli embeddings (evitiamo input_ids)
             embed_layer = _get_embedding_layer(model)
-            embeds = embed_layer(ids)  # shape: [1, seq_len, hidden_dim]
+            embeds = embed_layer(ids)  # [1, seq_len, hidden_dim]
 
-            # Trova un layer target valido (es: ultimo transformer block)
+            # Trova il layer target (ultimo blocco encoder)
             base_model = _get_base_model(model)
             if hasattr(base_model, 'encoder') and hasattr(base_model.encoder, 'layer'):
                 target_layer = base_model.encoder.layer[-1]
             else:
                 target_layer = base_model
 
-            # Wrappa la forward: Captum userà questa, non model(...) diretto
-            def custom_forward(embeds, attn_mask):
-                return model(inputs_embeds=embeds, attention_mask=attn_mask).logits
+            # Funzione forward custom, per evitare di toccare input_ids
+            def custom_forward(inputs_embeds, attention_mask):
+                output = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+                return output.logits
 
-            # Crea LRP usando la funzione custom
+            # LRP sul wrapper, non sul modello intero!
             lrp = LayerLRP(custom_forward, target_layer)
 
-            # Calcola le attribution
+            # Calcola le attribution su embeddings
             attributions = lrp.attribute(
                 inputs=embeds,
                 additional_forward_args=attn
             )
-            scores = attributions.sum(dim=-1).squeeze(0)  # [seq_len]
+            scores = attributions.sum(dim=-1).squeeze(0)
 
+            # Converti token
             tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0))
             log_timing("lrp", time.time() - start_time)
             return Attribution(tokens, scores.tolist())
 
         except Exception as e:
             print(f"Errore in LRP: {e}")
-            try:
-                tokens = tokenizer.convert_ids_to_tokens(
-                    tokenizer.encode(text, max_length=10, truncation=True)
-                )
-                scores = [0.0] * len(tokens)
-            except:
-                tokens = text.split()[:10]
-                scores = [0.0] * len(tokens)
+            tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text, max_length=10, truncation=True))
+            scores = [0.0] * len(tokens)
             log_timing("lrp", time.time() - start_time)
             return Attribution(tokens, scores)
+
 
     return explain
 
