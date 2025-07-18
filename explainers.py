@@ -8,6 +8,7 @@ Miglioramenti principali:
 3. Gestione errori più granulare
 4. Fallback intelligenti per ogni metodo
 5. Performance logging per debugging
+6. GPU Support: Fix per device compatibility
 
 Metodi: lime, shap, grad_input, attention_rollout, attention_flow, lrp
 """
@@ -21,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import time
 from transformers import PreTrainedModel, PreTrainedTokenizer
+import models  # AGGIUNTO: Import per GPU support
 
 # -------------------------------------------------------------------------
 # Librerie opzionali con import più robusti
@@ -106,7 +108,7 @@ def _get_embedding_layer(model):
         raise AttributeError("Impossibile trovare layer di embedding")
 
 def _safe_tokenize(text: str, tokenizer, max_length=MAX_LEN):
-    """Tokenizzazione sicura con gestione lunghezza e pulizia testo."""
+    """Tokenizzazione sicura con gestione lunghezza e GPU support."""
     text = text.strip()
     if len(text) < MIN_LEN:
         text = text + " " * (MIN_LEN - len(text))
@@ -118,12 +120,9 @@ def _safe_tokenize(text: str, tokenizer, max_length=MAX_LEN):
         max_length=max_length,
         padding='max_length'
     )
-
-    for key in encoded:
-        if hasattr(encoded[key], 'to'):
-            encoded[key] = encoded[key].to(models.DEVICE)
     
-    return encoded
+    # FIX: Sposta input su GPU
+    encoded = models.move_batch_to_device(encoded)
     
     return encoded
 
@@ -142,9 +141,6 @@ class Attribution:
         if len(self.tokens) > 5:
             items.append("...")
         return "Attribution(" + ", ".join(items) + ")"
-
-
-
 
 # -------------------------------------------------------------------------
 # 1. GRADIENT × INPUT (già funzionante)
@@ -383,7 +379,7 @@ def _attention_flow(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-### LIME
+# 4. LIME
 
 def _lime_text(model, tokenizer):
     if not LIME_AVAILABLE:
@@ -404,6 +400,10 @@ def _lime_text(model, tokenizer):
                 truncation=True,
                 max_length=MAX_LEN
             )
+            
+            # FIX: Sposta su GPU
+            encoded = models.move_batch_to_device(encoded)
+            
             with torch.no_grad():
                 outputs = model(**encoded)
                 logits = outputs.logits
@@ -466,6 +466,9 @@ def _kernel_shap(model, tokenizer):
                 truncation=True,
                 max_length=128  # Ridotto per velocità
             )
+            
+            # FIX: Sposta su GPU
+            encoded = models.move_batch_to_device(encoded)
             
             # Inferenza
             with torch.no_grad():
@@ -850,4 +853,5 @@ if __name__ == "__main__":
     print("  ✓ Fallback intelligenti per robustezza")
     print("  ✓ Timing logs per debugging performance")
     print("  ✓ Controlli dipendenze automatici")
+    print("  ✓ GPU Support: Fix device compatibility per tutti gli explainer")
     print("=" * 60)

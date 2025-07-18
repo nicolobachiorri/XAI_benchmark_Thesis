@@ -302,9 +302,9 @@ def test_level_3_metrics():
         
         for metric_name, result in results.items():
             if result["status"] == "OK":
-                print(f"  ✓ {metric_name}: {result['score']:.4f} ({result['time']:.1f}s)")
+                print(f"{metric_name}: {result['score']:.4f} ({result['time']:.1f}s)")
             else:
-                print(f"  ✗ {metric_name}: {result.get('error', 'Unknown error')}")
+                print(f" {metric_name}: {result.get('error', 'Unknown error')}")
         
         return success_count > 0
         

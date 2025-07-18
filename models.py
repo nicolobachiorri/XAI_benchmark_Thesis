@@ -112,6 +112,15 @@ def move_batch_to_device(batch):
     else:
         return batch
 
+def move_batch_to_device(batch):
+    """Sposta un batch di dati sul device corretto."""
+    if isinstance(batch, dict):
+        return {k: v.to(DEVICE) if hasattr(v, 'to') else v for k, v in batch.items()}
+    elif hasattr(batch, 'to'):
+        return batch.to(DEVICE)
+    else:
+        return batch
+
 def get_gpu_memory_usage():
     """Restituisce uso memoria GPU in GB."""
     if torch.cuda.is_available():
