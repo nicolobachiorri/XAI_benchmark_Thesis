@@ -1,9 +1,11 @@
 """
-report.py – Genera tabelle per le metriche XAI
-==============================================
+report.py – Genera tabelle per le metriche XAI (AGGIORNATO)
+==========================================================
 
 Crea tabelle con risultati di Robustness, Consistency e Contrastivity
 per tutti i modelli e explainer.
+
+AGGIORNAMENTO: Consistency ora usa inference seed invece di modelli diversi.
 
 Uso:
     python report.py                    # Tutte le metriche, 500 esempi
@@ -26,63 +28,129 @@ from utils import set_seed, Timer
 # Configurazione
 EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "lrp"]
 METRICS = ["robustness", "contrastivity", "consistency"]
+DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 
 set_seed(42)
 
 def get_test_data(sample_size=None):
-    """Carica dati di test."""
+    """Carica dati di test con campionamento stratificato."""
     texts = dataset.test_df["text"].tolist()
     labels = dataset.test_df["label"].tolist()
     
     if sample_size and sample_size < len(texts):
         # Campionamento stratificato
-        pos_texts = [t for t, l in zip(texts, labels) if l == 1][:sample_size//2]
-        neg_texts = [t for t, l in zip(texts, labels) if l == 0][:sample_size//2]
-        texts = pos_texts + neg_texts
-        labels = [1] * len(pos_texts) + [0] * len(neg_texts)
+        pos_indices = [i for i, l in enumerate(labels) if l == 1]
+        neg_indices = [i for i, l in enumerate(labels) if l == 0]
+        
+        n_pos = min(sample_size // 2, len(pos_indices))
+        n_neg = min(sample_size - n_pos, len(neg_indices))
+        
+        import random
+        selected_pos = random.sample(pos_indices, n_pos)
+        selected_neg = random.sample(neg_indices, n_neg)
+        
+        selected_indices = selected_pos + selected_neg
+        random.shuffle(selected_indices)
+        
+        texts = [texts[i] for i in selected_indices]
+        labels = [labels[i] for i in selected_indices]
     
     return texts, labels
 
 def eval_robustness(model_key, explainer_name, sample_size):
     """Valuta robustness."""
-    model = models.load_model(model_key)
-    tokenizer = models.load_tokenizer(model_key)
-    explainer = explainers.get_explainer(explainer_name, model, tokenizer)
-    texts, _ = get_test_data(sample_size)
-    return metrics.evaluate_robustness_over_dataset(model, tokenizer, explainer, texts)
+    print(f"  Computing robustness for {model_key} + {explainer_name}")
+    
+    try:
+        model = models.load_model(model_key)
+        tokenizer = models.load_tokenizer(model_key)
+        explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+        texts, _ = get_test_data(sample_size)
+        
+        score = metrics.evaluate_robustness_over_dataset(
+            model, tokenizer, explainer, texts, show_progress=False
+        )
+        
+        print(f"    Robustness: {score:.4f}")
+        return score
+        
+    except Exception as e:
+        print(f"    Error: {e}")
+        return float('nan')
 
 def eval_contrastivity(model_key, explainer_name, sample_size):
     """Valuta contrastivity."""
-    model = models.load_model(model_key)
-    tokenizer = models.load_tokenizer(model_key)
-    explainer = explainers.get_explainer(explainer_name, model, tokenizer)
-    texts, labels = get_test_data(sample_size)
+    print(f"  Computing contrastivity for {model_key} + {explainer_name}")
     
-    # Separa per classe
-    pos_attrs = []
-    neg_attrs = []
-    
-    for text, label in zip(texts, labels):
-        attr = explainer(text)
-        if label == 1:
-            pos_attrs.append(attr)
-        else:
-            neg_attrs.append(attr)
-    
-    return metrics.compute_contrastivity(pos_attrs, neg_attrs)
+    try:
+        model = models.load_model(model_key)
+        tokenizer = models.load_tokenizer(model_key)
+        explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+        texts, labels = get_test_data(sample_size)
+        
+        # Separa per classe
+        pos_texts = [t for t, l in zip(texts, labels) if l == 1]
+        neg_texts = [t for t, l in zip(texts, labels) if l == 0]
+        
+        # Limita numero di testi per velocità
+        pos_texts = pos_texts[:min(50, len(pos_texts))]
+        neg_texts = neg_texts[:min(50, len(neg_texts))]
+        
+        # Genera attribution
+        pos_attrs = []
+        for text in pos_texts:
+            try:
+                attr = explainer(text)
+                pos_attrs.append(attr)
+            except Exception:
+                continue
+        
+        neg_attrs = []
+        for text in neg_texts:
+            try:
+                attr = explainer(text)
+                neg_attrs.append(attr)
+            except Exception:
+                continue
+        
+        if len(pos_attrs) == 0 or len(neg_attrs) == 0:
+            print("    Warning: No valid attributions generated")
+            return 0.0
+        
+        score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
+        print(f"    Contrastivity: {score:.4f}")
+        return score
+        
+    except Exception as e:
+        print(f"    Error: {e}")
+        return float('nan')
 
-def eval_consistency(model_a, model_b, explainer_name, sample_size):
-    """Valuta consistency tra due modelli."""
-    # Carica modelli
-    m1 = models.load_model(model_a)
-    m2 = models.load_model(model_b)
-    t1 = models.load_tokenizer(model_a)
-    t2 = models.load_tokenizer(model_b)
-    e1 = explainers.get_explainer(explainer_name, m1, t1)
-    e2 = explainers.get_explainer(explainer_name, m2, t2)
+def eval_consistency(model_key, explainer_name, sample_size, seeds=DEFAULT_CONSISTENCY_SEEDS):
+    """Valuta consistency con inference seed approach."""
+    print(f"  Computing consistency for {model_key} + {explainer_name}")
     
-    texts, _ = get_test_data(sample_size)
-    return metrics.evaluate_consistency_over_dataset(m1, m2, t1, t2, e1, e2, texts)
+    try:
+        model = models.load_model(model_key)
+        tokenizer = models.load_tokenizer(model_key)
+        explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+        texts, _ = get_test_data(min(50, sample_size))  # Limita per consistency
+        
+        # Usa la nuova funzione di consistency
+        score = metrics.evaluate_consistency_over_dataset(
+            model=model,
+            tokenizer=tokenizer,
+            explainer=explainer,
+            texts=texts,
+            seeds=seeds,
+            show_progress=False
+        )
+        
+        print(f"    Consistency: {score:.4f}")
+        return score
+        
+    except Exception as e:
+        print(f"    Error: {e}")
+        return float('nan')
 
 def build_robustness_table(sample_size):
     """Tabella robustness: explainer x modelli."""
@@ -119,34 +187,75 @@ def build_contrastivity_table(sample_size):
     return pd.DataFrame(results).T
 
 def build_consistency_table(sample_size):
-    """Tabella consistency: explainer x coppie modelli."""
-    print("Calcolando consistency...")
+    """Tabella consistency: explainer x modelli (con inference seed)."""
+    print("Calcolando consistency con inference seed...")
     results = defaultdict(dict)
     
-    model_list = list(models.MODELS.keys())
-    
     for explainer in EXPLAINERS:
-        for i, model_a in enumerate(model_list):
-            for model_b in model_list[i+1:]:  # Solo coppie uniche
-                pair_name = f"{model_a}_vs_{model_b}"
-                try:
-                    with Timer(f"{explainer} + {pair_name}"):
-                        score = eval_consistency(model_a, model_b, explainer, sample_size)
-                    results[explainer][pair_name] = score
-                except Exception as e:
-                    print(f"Errore {explainer}+{pair_name}: {e}")
-                    results[explainer][pair_name] = float('nan')
+        for model_key in models.MODELS.keys():
+            try:
+                with Timer(f"{explainer} + {model_key}"):
+                    score = eval_consistency(model_key, explainer, sample_size)
+                results[explainer][model_key] = score
+            except Exception as e:
+                print(f"Errore {explainer}+{model_key}: {e}")
+                results[explainer][model_key] = float('nan')
     
     return pd.DataFrame(results).T
+
+def print_table_summary(df, metric_name):
+    """Stampa riassunto della tabella."""
+    print(f"\n=== {metric_name.upper()} SUMMARY ===")
+    
+    # Statistiche per explainer
+    print("Per explainer:")
+    for explainer in df.index:
+        values = df.loc[explainer].dropna()
+        if len(values) > 0:
+            mean_val = values.mean()
+            std_val = values.std()
+            print(f"  {explainer:>15}: {mean_val:.4f} ± {std_val:.4f}")
+    
+    # Statistiche per modello
+    print("Per modello:")
+    for model in df.columns:
+        values = df[model].dropna()
+        if len(values) > 0:
+            mean_val = values.mean()
+            std_val = values.std()
+            print(f"  {model:>15}: {mean_val:.4f} ± {std_val:.4f}")
+    
+    # Migliori combinazioni
+    print("Top 3 combinazioni:")
+    flat_data = []
+    for explainer in df.index:
+        for model in df.columns:
+            value = df.loc[explainer, model]
+            if not pd.isna(value):
+                flat_data.append((explainer, model, value))
+    
+    # Ordina per metrica (robustness: più basso è meglio, altri: più alto è meglio)
+    if metric_name == "robustness":
+        flat_data.sort(key=lambda x: x[2])  # Ascendente
+        print("  (Più basso = meglio)")
+    else:
+        flat_data.sort(key=lambda x: x[2], reverse=True)  # Discendente
+        print("  (Più alto = meglio)")
+    
+    for i, (explainer, model, value) in enumerate(flat_data[:3]):
+        print(f"  {i+1}. {explainer} + {model}: {value:.4f}")
 
 def main():
     parser = argparse.ArgumentParser(description="Genera tabelle XAI")
     parser.add_argument("--metric", choices=METRICS + ["all"], default="all")
     parser.add_argument("--sample", type=int, default=500)
     parser.add_argument("--csv", action="store_true", help="Output CSV")
+    parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_CONSISTENCY_SEEDS,
+                       help="Seed per consistency (default: 42 123 456 789)")
     args = parser.parse_args()
 
     print(f"Generando tabelle con {args.sample} esempi...")
+    print(f"Seed per consistency: {args.seeds}")
     
     # Scegli metriche
     if args.metric == "all":
@@ -154,9 +263,15 @@ def main():
     else:
         metrics_to_run = [args.metric]
 
+    # Aggiorna seed globali per consistency
+    global DEFAULT_CONSISTENCY_SEEDS
+    DEFAULT_CONSISTENCY_SEEDS = args.seeds
+
     # Genera tabelle
     for metric in metrics_to_run:
-        print(f"\n=== {metric.upper()} ===")
+        print(f"\n{'='*60}")
+        print(f"GENERANDO TABELLA: {metric.upper()}")
+        print(f"{'='*60}")
         
         if metric == "robustness":
             df = build_robustness_table(args.sample)
@@ -171,7 +286,11 @@ def main():
             df.to_csv(filename)
             print(f"Salvato: {filename}")
         else:
+            print("\nTabella:")
             print(df.to_markdown(floatfmt=".4f"))
+        
+        # Stampa riassunto
+        print_table_summary(df, metric)
 
 if __name__ == "__main__":
     main()

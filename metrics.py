@@ -1,22 +1,18 @@
 """
-metrics.py – Metriche del paper XAI (senza Human-Agreement)
-===========================================================
+metrics.py – Metriche del paper XAI (con Consistency corretta)
+============================================================
 
 Implementa **tre metriche automatiche** tratte da "Evaluating the effectiveness
 of XAI techniques for encoder-based language models".
 
 1. **Robustness** – stabilità delle saliency sotto perturbazione del testo
-2. **Consistency** – allineamento delle saliency fra due modelli gemelli
+2. **Consistency** – stabilità dell'explainer con inference seed diversi (CORRETTA)
 3. **Contrastivity** – diversità delle saliency fra classi opposte
 
 La metrica di *Human-reasoning Agreement* non è implementata perché richiede
 annotazioni manuali.
 
-Ottimizzato per modelli pre-trained con gestione robusta di errori e
-compatibilità con diverse architetture (BERT, RoBERTa, DistilBERT, TinyBERT).
-
-Dipendenze:
-    transformers, torch, numpy, scipy, tqdm
+AGGIORNAMENTO: Consistency ora usa inference seed invece di modelli diversi.
 """
 
 # ==== 1. Librerie ====
@@ -34,7 +30,10 @@ from tqdm import tqdm
 # ==== 2. Parametri configurabili ====
 DEFAULT_PERTURBATION_RATIO = 0.15
 MIN_SHARED_TOKENS = 2  # Minimo numero di token condivisi per calcolare correlazione
-RANDOM_SEED = 42
+RANDOM_STATE = 42
+
+# Parametri per consistency con inference seed
+DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 
 # ==== 3. Helper per gestione probabilità ====
 
@@ -206,68 +205,198 @@ def compute_robustness(
         print(f"Errore in compute_robustness: {e}")
         return 0.0
 
-# ==== 6. Consistency ====
+# ==== 6. Consistency (CORRETTA CON INFERENCE SEED) ====
 
-def compute_consistency(
-    model_a: PreTrainedModel,
-    model_b: PreTrainedModel,
-    tokenizer_a: PreTrainedTokenizer,
-    tokenizer_b: PreTrainedTokenizer,
-    explainer_a: Callable[[str], Attribution],
-    explainer_b: Callable[[str], Attribution],
-    text: str,
+def compute_consistency_inference_seed(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
+    show_progress: bool = True
 ) -> float:
     """
-    Calcola la consistency come correlazione di Spearman tra le saliency
-    di due modelli per token comuni.
+    Calcola consistency usando inference seed diversi (approccio corretto).
+    
+    Invece di confrontare modelli diversi, confronta lo stesso modello+explainer
+    con seed diversi per l'inferenza, attivando dropout per stocasticità.
     
     Args:
-        model_a, model_b: Due modelli da confrontare
-        tokenizer_a, tokenizer_b: Tokenizer corrispondenti
-        explainer_a, explainer_b: Explainer per ogni modello
-        text: Testo da analizzare
+        model: Modello pre-trained
+        tokenizer: Tokenizer corrispondente
+        explainer: Funzione explainer
+        texts: Lista di testi da analizzare
+        seeds: Lista di seed per inferenza stocastica
+        show_progress: Se mostrare progress
     
     Returns:
-        float: Correlazione di Spearman (-1 a 1, più alto = più consistente)
+        float: Correlazione di Spearman media tra tutte le coppie di seed
     """
+    
+    if show_progress:
+        print(f"Computing consistency with {len(seeds)} inference seeds...")
+    
+    # ATTIVA training mode per dropout stocastico
+    original_mode = model.training
+    model.train()
+    
+    # DISATTIVA gradient computation (non vogliamo fine-tuning)
+    original_requires_grad = {}
+    for name, param in model.named_parameters():
+        original_requires_grad[name] = param.requires_grad
+        param.requires_grad_(False)
+    
+    if show_progress:
+        print(f"  Model set to training mode (dropout active)")
+        # Mostra se ci sono layer dropout
+        dropout_layers = [name for name, module in model.named_modules() 
+                         if isinstance(module, torch.nn.Dropout)]
+        if dropout_layers:
+            print(f"  Found {len(dropout_layers)} dropout layers")
+        else:
+            print(f"  WARNING: No dropout layers found - consistency might be perfect")
+    
     try:
-        # Calcola attribution per entrambi i modelli
-        attr_a = explainer_a(text)
-        attr_b = explainer_b(text)
+        # Genera explanations per ogni inference seed
+        explanations_by_seed = {}
         
+        for seed in seeds:
+            if show_progress:
+                print(f"  Processing inference seed {seed}...")
+            
+            explanations = []
+            text_iterator = tqdm(texts, desc=f"Seed {seed}", leave=False) if show_progress else texts
+            
+            for text in text_iterator:
+                try:
+                    # Imposta seed prima di ogni explanation per dropout stocastico
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed)
+                    
+                    attr = explainer(text)
+                    explanations.append(attr)
+                except Exception as e:
+                    if show_progress:
+                        print(f"    Error on text: {e}")
+                    # Aggiungi attribution vuota
+                    explanations.append(Attribution([], []))
+            
+            explanations_by_seed[seed] = explanations
+        
+        # Calcola consistency tra tutte le coppie di seed
+        consistency_scores = []
+        
+        for i, seed_a in enumerate(seeds):
+            for j, seed_b in enumerate(seeds[i+1:], i+1):
+                if show_progress:
+                    print(f"  Comparing seeds {seed_a} vs {seed_b}...")
+                
+                correlation = _compute_spearman_correlation_explanations(
+                    explanations_by_seed[seed_a],
+                    explanations_by_seed[seed_b]
+                )
+                consistency_scores.append(correlation)
+        
+        # Media di tutte le correlazioni
+        final_consistency = float(np.mean(consistency_scores)) if consistency_scores else 0.0
+        
+        if show_progress:
+            print(f"  Final consistency: {final_consistency:.4f}")
+            if final_consistency > 0.99:
+                print(f"  NOTE: Very high consistency - model might not have significant dropout")
+        
+        return final_consistency
+        
+    finally:
+        # Ripristina stato originale del modello
+        model.train(original_mode)
+        for name, param in model.named_parameters():
+            param.requires_grad_(original_requires_grad[name])
+
+def _compute_spearman_correlation_explanations(
+    explanations_a: List[Attribution],
+    explanations_b: List[Attribution]
+) -> float:
+    """
+    Calcola correlazione di Spearman tra due liste di explanations.
+    """
+    correlations = []
+    
+    for attr_a, attr_b in zip(explanations_a, explanations_b):
+        # Skip se una delle attribution è vuota
         if not attr_a.tokens or not attr_b.tokens:
-            return 0.0
+            continue
         
-        # Allinea token comuni preservando ordine in attr_a
+        # Allinea token comuni
         shared_scores_a, shared_scores_b = [], []
         
-        for tok, score_a in zip(attr_a.tokens, attr_a.scores):
-            if tok in attr_b.tokens:
-                idx = attr_b.tokens.index(tok)
+        # Usa set per lookup più veloce
+        tokens_b_set = set(attr_b.tokens)
+        token_to_idx_b = {tok: i for i, tok in enumerate(attr_b.tokens)}
+        
+        for token, score_a in zip(attr_a.tokens, attr_a.scores):
+            if token in tokens_b_set:
+                idx = token_to_idx_b[token]
                 shared_scores_a.append(score_a)
                 shared_scores_b.append(attr_b.scores[idx])
         
         # Calcola correlazione se ci sono abbastanza token condivisi
-        if len(shared_scores_a) < MIN_SHARED_TOKENS:
-            return 0.0
-        
-        # Gestisci caso di varianza zero
-        if np.var(shared_scores_a) == 0 or np.var(shared_scores_b) == 0:
-            return 1.0 if np.array_equal(shared_scores_a, shared_scores_b) else 0.0
-        
-        rho, p_value = spearmanr(shared_scores_a, shared_scores_b)
-        
-        # Gestisci NaN (può succedere con dati costanti)
-        if np.isnan(rho):
-            return 0.0
-        
-        return float(rho)
-        
-    except Exception as e:
-        print(f"Errore in compute_consistency: {e}")
-        return 0.0
+        if len(shared_scores_a) >= MIN_SHARED_TOKENS:
+            # Converti in numpy per calcolo più veloce
+            arr_a = np.array(shared_scores_a)
+            arr_b = np.array(shared_scores_b)
+            
+            # Gestisci varianza zero
+            if np.var(arr_a) == 0 or np.var(arr_b) == 0:
+                correlation = 1.0 if np.array_equal(arr_a, arr_b) else 0.0
+            else:
+                try:
+                    rho, _ = spearmanr(arr_a, arr_b)
+                    correlation = float(rho) if not np.isnan(rho) else 0.0
+                except Exception:
+                    correlation = 0.0
+            
+            correlations.append(correlation)
+    
+    return np.mean(correlations) if correlations else 0.0
 
-# ==== 7. Contrastivity ====
+# ==== 7. Consistency (Solo Inference Seed) ====
+
+def compute_consistency(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
+    show_progress: bool = False
+) -> float:
+    """
+    Calcola consistency usando inference seed diversi.
+    
+    Args:
+        model: Modello da testare
+        tokenizer: Tokenizer del modello
+        explainer: Explainer da testare
+        texts: Testi da analizzare
+        seeds: Seed per inferenza stocastica
+        show_progress: Se mostrare progress
+    
+    Returns:
+        float: Consistency score (correlazione di Spearman media)
+    """
+    return compute_consistency_inference_seed(
+        model=model,
+        tokenizer=tokenizer,
+        explainer=explainer,
+        texts=texts,
+        seeds=seeds,
+        show_progress=show_progress
+    )
+
+# ==== 8. Contrastivity ====
 
 def _normalize_scores(scores: Sequence[float]) -> np.ndarray:
     """Normalizza i punteggi per formare una distribuzione di probabilità."""
@@ -352,7 +481,24 @@ def compute_contrastivity(
         print(f"Errore in compute_contrastivity: {e}")
         return 0.0
 
-# ==== 8. Funzioni batch per valutazione su dataset ====
+
+
+# Vocabolario: ["great", "terrible", "movie", "film"]
+# Positive: great=0.8, terrible=0.0, movie=0.2, film=0.1
+# Negative: great=0.0, terrible=0.9, movie=0.2, film=0.1
+
+# Dopo normalizzazione:
+# p = [0.73, 0.0, 0.18, 0.09]  # Classe positiva
+# q = [0.0, 0.75, 0.17, 0.08]  # Classe negativa
+
+# KL Divergence:
+# KL = 0.73 * log2(0.73/0.00001) + 0.0 * log2(...) + 0.18 * log2(0.18/0.17) + 0.09 * log2(0.09/0.08)
+# KL = 0.73 * 16.49 + 0 + 0.18 * 0.08 + 0.09 * 0.17
+# KL = 12.04 + 0 + 0.014 + 0.015 = 12.07
+
+# Contrastivity = 12.07 (ALTO = molto contrastivo)
+
+# ==== 9. Funzioni batch per valutazione su dataset ====
 
 def evaluate_robustness_over_dataset(
     model: PreTrainedModel,
@@ -399,63 +545,39 @@ def evaluate_robustness_over_dataset(
         return 0.0
 
 def evaluate_consistency_over_dataset(
-    model_a: PreTrainedModel,
-    model_b: PreTrainedModel,
-    tokenizer_a: PreTrainedTokenizer,
-    tokenizer_b: PreTrainedTokenizer,
-    explainer_a: Callable[[str], Attribution],
-    explainer_b: Callable[[str], Attribution],
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
     texts: List[str],
     sample_size: Optional[int] = None,
     show_progress: bool = True,
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS
 ) -> float:
     """
-    Valuta consistency tra due modelli su un dataset.
+    Valuta consistency su dataset usando inference seed.
+    
+    Args:
+        model: Modello da testare
+        tokenizer: Tokenizer del modello
+        explainer: Explainer da testare
+        texts: Lista di testi
+        sample_size: Numero di esempi (None = tutti)
+        show_progress: Se mostrare progress
+        seeds: Seed per inferenza stocastica
     
     Returns:
-        float: Media delle correlazioni di Spearman
+        float: Consistency score media
     """
-    try:
-        # Campiona se necessario
-        if sample_size and sample_size < len(texts):
-            texts = random.sample(texts, sample_size)
-        
-        # Calcola consistency per ogni testo
-        consistency_scores = []
-        iterator = tqdm(texts, desc="Consistency") if show_progress else texts
-        
-        for text in iterator:
-            try:
-                if text.strip():  # Skip testi vuoti
-                    score = compute_consistency(
-                        model_a, model_b, tokenizer_a, tokenizer_b,
-                        explainer_a, explainer_b, text
-                    )
-                    consistency_scores.append(score)
-            except Exception as e:
-                print(f"Errore su testo: {e}")
-                continue
-        
-        return float(np.mean(consistency_scores)) if consistency_scores else 0.0
-        
-    except Exception as e:
-        print(f"Errore in evaluate_consistency_over_dataset: {e}")
-        return 0.0
+    return compute_consistency_inference_seed(
+        model=model,
+        tokenizer=tokenizer,
+        explainer=explainer,
+        texts=texts[:sample_size] if sample_size else texts,
+        seeds=seeds,
+        show_progress=show_progress
+    )
 
-def evaluate_contrastivity_over_dataset(
-    positive_attrs: List[Attribution],
-    negative_attrs: List[Attribution],
-    use_jensen_shannon: bool = False,
-) -> float:
-    """
-    Valuta contrastivity su liste di attribution.
-    
-    Returns:
-        float: Divergenza KL o Jensen-Shannon
-    """
-    return compute_contrastivity(positive_attrs, negative_attrs, use_jensen_shannon)
-
-# ==== 9. Utility per debugging ====
+# ==== 10. Utility per debugging ====
 
 def print_metric_summary(
     robustness_score: float,
@@ -469,10 +591,70 @@ def print_metric_summary(
     print(f"Contrastivity: {contrastivity_score:.4f} (piu alto = piu contrastivo)")
     print("==============================\n")
 
-# ==== 10. Test di compatibilità ====
-if __name__ == "__main__":
-    print("Test funzioni di perturbazione...")
+def test_inference_seed_effect():
+    """Test per verificare che l'inference seed abbia effetto."""
+    print("Testing inference seed effect...")
     
+    try:
+        import models
+        model = models.load_model("distilbert")
+        tokenizer = models.load_tokenizer("distilbert")
+        
+        test_text = "This movie is great!"
+        encoded = tokenizer(test_text, return_tensors="pt", max_length=50, truncation=True)
+        
+        # Test in eval mode
+        model.eval()
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        output1 = model(**encoded).logits
+        
+        random.seed(123)
+        np.random.seed(123)
+        torch.manual_seed(123)
+        output2 = model(**encoded).logits
+        
+        eval_identical = torch.allclose(output1, output2, atol=1e-6)
+        print(f"  Eval mode - Identical outputs: {eval_identical}")
+        
+        # Test in training mode
+        model.train()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        output1 = model(**encoded).logits
+        
+        random.seed(123)
+        np.random.seed(123)
+        torch.manual_seed(123)
+        output2 = model(**encoded).logits
+        
+        train_identical = torch.allclose(output1, output2, atol=1e-6)
+        print(f"  Training mode - Identical outputs: {train_identical}")
+        
+        if eval_identical and not train_identical:
+            print("  Inference seed is working correctly")
+            return True
+        elif eval_identical and train_identical:
+            print("  WARNING: Dropout might not be significant enough")
+            return False
+        else:
+            print("  Unexpected behavior")
+            return False
+            
+    except Exception as e:
+        print(f"  Test failed: {e}")
+        return False
+
+# ==== 11. Test di compatibilità ====
+if __name__ == "__main__":
+    print("Testing metrics...")
+    
+    # Test funzioni di perturbazione
     test_text = "This movie was absolutely fantastic and I loved every minute of it!"
     
     print(f"Originale: {test_text}")
@@ -480,11 +662,22 @@ if __name__ == "__main__":
     print(f"Deleted: {_random_delete(test_text)}")
     print(f"Substituted: {_random_substitute(test_text)}")
     
-    print("\nTest normalizzazione...")
+    # Test normalizzazione
+    print("\nTesting normalization...")
     test_scores = [0.5, -0.2, 0.8, 0.1, -0.1]
     normalized = _normalize_scores(test_scores)
     print(f"Originali: {test_scores}")
     print(f"Normalizzati: {normalized}")
     print(f"Somma: {np.sum(normalized)}")
     
-    print("\nTest metrics completato!")
+    # Test inference seed effect
+    print("\nTesting inference seed effect...")
+    test_inference_seed_effect()
+    
+    print("\nMetrics test completato!")
+    print("\nNOTE: Consistency ora usa solo inference seed approach:")
+    print("1. compute_consistency(model, tokenizer, explainer, texts, seeds)")
+    print("2. evaluate_consistency_over_dataset(model, tokenizer, explainer, texts)")
+    print("3. Il risultato misura la stabilità dell'explainer")
+    print("4. Valori attesi: 0.5-0.9 (più alto = più stabile)")
+    print("5. Se consistency > 0.99, il dropout potrebbe essere troppo basso")
