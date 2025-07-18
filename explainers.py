@@ -549,12 +549,15 @@ def _kernel_shap(model, tokenizer):
             
             # Estrai scores
             if isinstance(shap_values, list):
-                scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
+                raw_scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
             else:
-                scores = shap_values[0] if shap_values.ndim > 1 else shap_values
-            
-            log_timing("shap", time.time() - start_time)
+                raw_scores = shap_values[0] if shap_values.ndim > 1 else shap_values
+
+            # Forza conversione in array 1D di float
+            scores = np.array(raw_scores, dtype=float).flatten()
+
             return Attribution(words, scores.tolist())
+
             
         except Exception as e:
             print(f"Errore in SHAP: {e}")
