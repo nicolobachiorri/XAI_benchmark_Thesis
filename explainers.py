@@ -393,19 +393,20 @@ def _kernel_shap(model, tokenizer):
                return Attribution(["[EMPTY]"], [0.0])
            
            def predict_for_shap(word_presence):
-               """FIXED: no more infinite recursion."""
-               texts = []
-               for presence in word_presence:
-                   text_words = []
-                   for i in range(len(words)):
-                       if presence[i] > 0.5:
-                           text_words.append(words[i])
-                       else:
-                           text_words.append("[MASK]")
-                   texts.append(" ".join(text_words))
-               
-               # FIX: chiama predict_proba, NON predict_for_shap
-               return predict_proba(texts)
+                """FIXED: convert strings to float."""
+                texts = []
+                for presence in word_presence:
+                    text_words = []
+                    for i in range(len(words)):
+                        # FIX: converti esplicitamente a float
+                        presence_val = float(presence[i])
+                        if presence_val > 0.5:
+                            text_words.append(words[i])
+                        else:
+                            text_words.append("[MASK]")
+                    texts.append(" ".join(text_words))
+                
+                return predict_proba(texts)
            
            # Background: tutti i token assenti
            background = np.zeros((1, len(words)))
