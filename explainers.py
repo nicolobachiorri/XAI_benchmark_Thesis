@@ -438,7 +438,7 @@ def _kernel_shap(model, tokenizer):
             return Attribution(["[ERROR]"], [0.0])
     
     return explain
-
+    
     def predict_proba(texts):
         """Prediction function per SHAP."""
         try:
