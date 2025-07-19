@@ -358,107 +358,91 @@ def _lime_text(model, tokenizer):
     
     return explain
 
-# ==== SHAP ====
+
+### new SHAP 
+
 def _kernel_shap(model, tokenizer):
-    """SHAP explainer (fixed)."""
-    if not SHAP_AVAILABLE:
-        def explain(text: str) -> Attribution:
-            print("[ERROR] SHAP not available")
-            return Attribution(["[NO_SHAP]"], [0.0])
-        return explain
+   """SHAP explainer - BUG FIXED."""
+   if not SHAP_AVAILABLE:
+       def explain(text: str) -> Attribution:
+           print("[ERROR] SHAP not available")
+           return Attribution(["[NO_SHAP]"], [0.0])
+       return explain
+   
+   def predict_proba(texts):
+       """Prediction function per SHAP."""
+       try:
+           if isinstance(texts, str):
+               texts = [texts]
+           
+           encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+           encoded = models.move_batch_to_device(encoded)
+           
+           with torch.no_grad():
+               logits = model(**encoded).logits
+               return F.softmax(logits, dim=-1).cpu().numpy()
+       except Exception as e:
+           print(f"[ERROR] SHAP prediction failed: {e}")
+           return np.random.rand(len(texts), 2)
+   
+   def explain(text: str) -> Attribution:
+       start_time = time.time()
+       try:
+           words = text.split()[:6]  # Massimo 6 parole per stabilità
+           if len(words) == 0:
+               return Attribution(["[EMPTY]"], [0.0])
+           
+           def predict_for_shap(word_presence):
+               """FIXED: no more infinite recursion."""
+               texts = []
+               for presence in word_presence:
+                   text_words = []
+                   for i in range(len(words)):
+                       if presence[i] > 0.5:
+                           text_words.append(words[i])
+                       else:
+                           text_words.append("[MASK]")
+                   texts.append(" ".join(text_words))
+               
+               # FIX: chiama predict_proba, NON predict_for_shap
+               return predict_proba(texts)
+           
+           # Background: tutti i token assenti
+           background = np.zeros((1, len(words)))
+           
+           # Crea explainer SHAP
+           explainer_obj = shap.KernelExplainer(predict_for_shap, background)
+           
+           # Calcola SHAP values con meno samples
+           shap_values = explainer_obj.shap_values(
+               np.ones((1, len(words))), 
+               nsamples=10,  # Molto ridotto
+               silent=True
+           )
+           
+           # Estrai scores
+           if isinstance(shap_values, list):
+               scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
+           else:
+               scores = shap_values[0] if shap_values.ndim > 1 else shap_values
+           
+           # Converti a lista
+           if hasattr(scores, 'tolist'):
+               scores = scores.tolist()
+           else:
+               scores = list(scores)
+           
+           log_timing("shap", time.time() - start_time)
+           return Attribution(words, scores)
+           
+       except Exception as e:
+           print(f"[ERROR] SHAP explanation failed: {e}")
+           import traceback
+           traceback.print_exc()
+           return Attribution(["[ERROR]"], [0.0])
+   
+   return explain
 
-    def predict_proba(texts):
-        """Prediction function per SHAP."""
-        try:
-            if isinstance(texts, str):
-                texts = [texts]
-            encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-            encoded = models.move_batch_to_device(encoded)
-            with torch.no_grad():
-                logits = model(**encoded).logits
-                return F.softmax(logits, dim=-1).cpu().numpy()
-        except Exception as e:
-            print(f"[ERROR] SHAP prediction failed: {e}")
-            n_texts = len(texts) if isinstance(texts, list) else 1
-            return np.random.rand(n_texts, 2)
-
-    def explain(text: str) -> Attribution:
-        start_time = time.time()
-        try:
-            words = text.split()[:8]  # Limita a 8 parole per stabilità
-            if len(words) == 0:
-                return Attribution(["[EMPTY]"], [0.0])
-
-            def predict_for_shap(word_presence):
-                """Fixed prediction function for SHAP."""
-                try:
-                    if word_presence.ndim == 1:
-                        word_presence = word_presence.reshape(1, -1)
-
-                    texts = []
-                    for row in word_presence:
-                        text_words = []
-                        for i, presence in enumerate(row):
-                            if i < len(words):
-                                try:
-                                    value = float(presence)
-                                    if value > 0.5:
-                                        text_words.append(words[i])
-                                    else:
-                                        text_words.append("[MASK]")
-                                except (ValueError, TypeError):
-                                    print(f"[WARN] Invalid presence value: {presence}, using [MASK]")
-                                    text_words.append("[MASK]")
-
-                        if not text_words:
-                            text_words = ["[MASK]"]
-
-                        texts.append(" ".join(text_words))
-
-                    return predict_proba(texts)
-
-                except Exception as e:
-                    print(f"[ERROR] predict_for_shap failed: {e}")
-                    n_samples = len(word_presence) if hasattr(word_presence, '__len__') else 1
-                    return np.random.rand(n_samples, 2)
-
-            background = np.zeros((1, len(words)))
-
-            test_input = np.ones((1, len(words)))
-            test_output = predict_for_shap(test_input)
-            if test_output.shape[1] != 2:
-                raise ValueError(f"Prediction function returned wrong shape: {test_output.shape}")
-
-            explainer_obj = shap.KernelExplainer(predict_for_shap, background)
-
-            shap_values = explainer_obj.shap_values(
-                np.ones((1, len(words))),
-                nsamples=15,
-                silent=True
-            )
-
-            if isinstance(shap_values, list):
-                scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
-            else:
-                scores = shap_values[0] if shap_values.ndim > 1 else shap_values
-
-            if hasattr(scores, 'tolist'):
-                scores = scores.tolist()
-            elif not isinstance(scores, list):
-                scores = [float(scores)] if np.isscalar(scores) else scores.flatten().tolist()
-
-            scores = scores[:len(words)]
-            if len(scores) < len(words):
-                scores.extend([0.0] * (len(words) - len(scores)))
-
-            log_timing("shap", time.time() - start_time)
-            return Attribution(words, scores)
-
-        except Exception as e:
-            print(f"[ERROR] SHAP explanation failed: {e}")
-            return Attribution(["[ERROR]"], [0.0])
-
-    return explain
 
 # ==== Factory ====
 _EXPLAINERS = {
