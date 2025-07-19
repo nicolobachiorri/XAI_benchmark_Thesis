@@ -1,16 +1,7 @@
 """
-explainers.py – 
-======================================================
-metodi XAI implementati per modelli di sentiment analysis: 
-- Grad × Input
-- Attention Rollout
-- Attention Flow
-- LRP Conservativa
-- LIME
-- SHAP
-======================================================
+explainers.py – Gestione explainers per modelli di sentiment analysis
+============================================================
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,7 +11,7 @@ from typing import List, Dict, Callable
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import models
 
-# Dipendenze opzionali
+# Optional dependencies
 try:
     from lime.lime_text import LimeTextExplainer
     LIME_AVAILABLE = True
@@ -39,7 +30,6 @@ try:
 except ImportError:
     NETWORKX_AVAILABLE = False
 
-# Config
 MAX_LEN = 512
 DEBUG_TIMING = False
 
@@ -51,18 +41,24 @@ class Attribution:
     def __init__(self, tokens: List[str], scores: List[float]):
         self.tokens = tokens
         self.scores = scores
-    
+
     def __repr__(self):
         items = [f"{t}:{s:.3f}" for t, s in zip(self.tokens[:3], self.scores[:3])]
         return "Attribution(" + ", ".join(items) + "...)"
 
 def _safe_tokenize(text: str, tokenizer, max_length=MAX_LEN):
-    """Tokenizzazione sicura con GPU support."""
-    encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length, padding='max_length')
+    encoded = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding="max_length",
+        return_attention_mask=True,
+        return_token_type_ids="token_type_ids" in tokenizer.model_input_names
+    )
     return models.move_batch_to_device(encoded)
 
 def _get_embedding_layer(model):
-    """Trova layer di embedding."""
     if hasattr(model, 'bert'):
         return model.bert.embeddings.word_embeddings
     elif hasattr(model, 'distilbert'):
@@ -73,7 +69,6 @@ def _get_embedding_layer(model):
         return model.get_input_embeddings()
 
 def _normalize_scores(scores):
-    """Normalizza scores in [-0.5, +0.5]."""
     scores = np.array(scores)
     if scores.max() > scores.min():
         scores = (scores - scores.min()) / (scores.max() - scores.min())
@@ -82,198 +77,161 @@ def _normalize_scores(scores):
         scores = np.zeros_like(scores)
     return scores.tolist()
 
-# ============================================================================
-# GRADIENT × INPUT
-# ============================================================================
+def _filter_tokens_and_scores(enc, tokenizer, scores):
+    input_ids = enc["input_ids"].squeeze(0)
+    mask = enc["attention_mask"].squeeze(0).bool()
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[mask])
+    tokens = [t.lstrip("Ġ") for t in tokens]
+    filtered_scores = torch.tensor(scores)[mask].tolist()
+    return tokens, filtered_scores
 
 def _grad_input(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
         model.eval()
-        
+
         enc = _safe_tokenize(text, tokenizer)
         embed_layer = _get_embedding_layer(model)
         embeds = embed_layer(enc["input_ids"]).detach()
         embeds.requires_grad_(True)
-        
-        outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
+
+        try:
+            outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
+        except TypeError:
+            outputs = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+
         target = outputs.logits[:, 1].sum() if outputs.logits.size(-1) > 1 else outputs.logits.sum()
-        
         model.zero_grad()
         target.backward()
-        
-        if embeds.grad is not None:
-            scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0)
-        else:
-            scores = torch.zeros(enc["input_ids"].size(-1))
-        
-        tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-        log_timing("grad_input", time.time() - start_time)
-        return Attribution(tokens, _normalize_scores(scores.tolist()))
-    
-    return explain
 
-# ============================================================================
-# ATTENTION ROLLOUT (Ali et al. 2022)
-# ============================================================================
+        scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0) if embeds.grad is not None else torch.zeros(enc["input_ids"].size(-1))
+        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores.tolist())
+        log_timing("grad_input", time.time() - start_time)
+        return Attribution(tokens, _normalize_scores(scores))
+    return explain
 
 def _attention_rollout(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
         model.eval()
-        
+
         enc = _safe_tokenize(text, tokenizer)
         with torch.no_grad():
             outputs = model(**enc, output_attentions=True)
-        
+
         if not outputs.attentions:
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-            return Attribution(tokens, [0.1] * len(tokens))
-        
-        # Media su heads: [layers, seq_len, seq_len]
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, [0.1] * enc["input_ids"].size(-1))
+            return Attribution(tokens, scores)
+
         att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1)
-        
-        # Joint attention con residual
         I = torch.eye(att.size(-1), device=att.device)
         att = 0.5 * att + 0.5 * I.unsqueeze(0)
         att = att / att.sum(dim=-1, keepdim=True)
-        
-        # Rollout
+
         joint = att[0]
         for layer in att[1:]:
             joint = layer @ joint
-        
+
         scores = joint.sum(dim=0).cpu().numpy()
-        tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-        
+        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
         log_timing("attention_rollout", time.time() - start_time)
         return Attribution(tokens, _normalize_scores(scores))
-    
     return explain
-
-# ============================================================================
-# ATTENTION FLOW (Ali et al. 2022)
-# ============================================================================
 
 def _attention_flow(model, tokenizer):
     if not NETWORKX_AVAILABLE:
         raise ImportError("NetworkX richiesto per attention_flow")
-    
+
     def explain(text: str) -> Attribution:
         start_time = time.time()
         model.eval()
-        
+
         enc = _safe_tokenize(text, tokenizer, min(128, MAX_LEN))
         with torch.no_grad():
             outputs = model(**enc, output_attentions=True)
-        
+
         if not outputs.attentions:
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-            return Attribution(tokens, [0.0] * len(tokens))
-        
-        # Media su heads e batch
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, [0.0] * enc["input_ids"].size(-1))
+            return Attribution(tokens, scores)
+
         att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1).cpu().numpy()
         n_layers, seq_len, _ = att.shape
-        
-        # Residual + normalizzazione
         att = att + np.eye(seq_len)[None, ...]
         att = att / att.sum(axis=-1, keepdims=True)
-        
-        # Crea grafo semplificato
+
         G = nx.DiGraph()
-        tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-        
-        # Solo connessioni significative (>0.1)
         for l in range(n_layers):
             for i in range(seq_len):
                 for j in range(seq_len):
                     if att[l, i, j] > 0.1:
-                        u, v = l * seq_len + i, (l-1) * seq_len + j if l > 0 else j
+                        u, v = l * seq_len + i, (l - 1) * seq_len + j if l > 0 else j
                         G.add_edge(u, v, capacity=att[l, i, j])
-        
-        # Flow dal ultimo layer ai token iniziali
+
         scores = np.zeros(seq_len)
         try:
-            for i in range(min(5, seq_len)):  # Limita per performance
-                if G.has_node((n_layers-1) * seq_len + i) and G.has_node(i):
-                    flow = nx.maximum_flow_value(G, (n_layers-1) * seq_len + i, i)
+            for i in range(min(5, seq_len)):
+                if G.has_node((n_layers - 1) * seq_len + i) and G.has_node(i):
+                    flow = nx.maximum_flow_value(G, (n_layers - 1) * seq_len + i, i)
                     scores[i] = flow
         except:
             pass
-        
+
+        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
         log_timing("attention_flow", time.time() - start_time)
         return Attribution(tokens, _normalize_scores(scores))
-    
     return explain
-
-# ============================================================================
-# LRP CONSERVATIVA (Ali et al. 2022)
-# ============================================================================
 
 def _lrp(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
-        
-        # Patch LayerNorm per conservazione
         original_forwards = {}
         for name, module in model.named_modules():
             if isinstance(module, nn.LayerNorm):
                 original_forwards[name] = module.forward
-                
                 def make_conservative_forward(orig_module):
                     def conservative_forward(x):
                         if not x.requires_grad:
                             return orig_module._orig_forward(x)
-                        
                         mean = x.mean(dim=-1, keepdim=True)
                         var = x.var(dim=-1, keepdim=True, unbiased=False)
-                        centered = x - mean
-                        std = torch.sqrt(var + orig_module.eps).detach()  # Detach per conservazione
-                        normalized = centered / std
-                        
-                        if hasattr(orig_module, 'weight') and orig_module.weight is not None:
-                            normalized = normalized * orig_module.weight
-                        if hasattr(orig_module, 'bias') and orig_module.bias is not None:
-                            normalized = normalized + orig_module.bias
-                        
+                        std = torch.sqrt(var + orig_module.eps).detach()
+                        normalized = (x - mean) / std
+                        if hasattr(orig_module, 'weight'):
+                            normalized *= orig_module.weight
+                        if hasattr(orig_module, 'bias'):
+                            normalized += orig_module.bias
                         return normalized
                     return conservative_forward
-                
                 module._orig_forward = module.forward
                 module.forward = make_conservative_forward(module)
-        
+
         try:
             model.eval()
             enc = _safe_tokenize(text, tokenizer)
-            
-            # Embedding con gradienti
             embed_layer = _get_embedding_layer(model)
             embeds = embed_layer(enc["input_ids"]).detach()
             embeds.requires_grad_(True)
-            
-            outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
+
+            try:
+                outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
+            except TypeError:
+                outputs = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+
             target = outputs.logits[:, 1].sum() if outputs.logits.size(-1) > 1 else outputs.logits.sum()
-            
             model.zero_grad()
             target.backward()
-            
-            if embeds.grad is not None:
-                scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0)
-            else:
-                scores = torch.zeros(enc["input_ids"].size(-1))
-            
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
+            scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0) if embeds.grad is not None else torch.zeros(enc["input_ids"].size(-1))
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores.tolist())
             log_timing("lrp", time.time() - start_time)
-            return Attribution(tokens, _normalize_scores(scores.tolist()))
-            
+            return Attribution(tokens, _normalize_scores(scores))
         finally:
-            # Ripristina forward originali
             for name, module in model.named_modules():
                 if hasattr(module, '_orig_forward'):
                     module.forward = module._orig_forward
                     delattr(module, '_orig_forward')
-    
+
     return explain
+
 
 # ============================================================================
 # LIME & SHAP (compatti)
