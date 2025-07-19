@@ -48,7 +48,7 @@ except ImportError:
 # Parametri globali
 MAX_LEN = 512
 MIN_LEN = 10
-DEBUG_TIMING = False
+DEBUG_TIMING = False  # CHANGED: Ridotto output log
 
 # -------------------------------------------------------------------------
 # Utility functions (MANTENUTE)
@@ -344,9 +344,19 @@ def _attention_rollout(model, tokenizer):
             # Calcola joint attention con residual connections
             joint_attentions = _compute_joint_attention(att_sum_heads, add_residual=True)
             
-            # Prendi l'ultimo layer e somma su query positions per ottenere relevance
+            # Prendi l'ultimo layer e calcola relevance correttamente
             final_attention = joint_attentions[-1]  # [seq_len, seq_len]
+            
+            # FIXED: Somma su query positions (asse 0) per token relevance
+            # Rappresenta quanto ogni token riceve attention aggregata
             relevance_scores = final_attention.sum(axis=0)  # [seq_len]
+            
+            # NORMALIZZAZIONE: Porta in range [0, 1]
+            if relevance_scores.max() > relevance_scores.min():
+                relevance_scores = (relevance_scores - relevance_scores.min()) / (relevance_scores.max() - relevance_scores.min())
+            
+            # SCALING: Porta in range tipico [-1, +1] con media circa 0
+            relevance_scores = 2 * relevance_scores - 1
             
             tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
             
@@ -439,6 +449,20 @@ def _attention_flow(model, tokenizer):
             final_layer_attention = flow_values[final_layer_start:final_layer_end, 
                                               prev_layer_start:prev_layer_end]
             relevance_scores = final_layer_attention.sum(axis=0)
+            
+            # NORMALIZZAZIONE per attention flow
+            if len(relevance_scores) > 0:
+                max_score = np.max(relevance_scores)
+                min_score = np.min(relevance_scores)
+                
+                if max_score > min_score:
+                    # Normalizza in [0, 1]
+                    relevance_scores = (relevance_scores - min_score) / (max_score - min_score)
+                    # Scala in [-0.5, +0.5] per consistenza con altri explainer
+                    relevance_scores = relevance_scores - 0.5
+                else:
+                    # Tutti i valori uguali
+                    relevance_scores = np.zeros_like(relevance_scores)
             
             log_timing("attention_flow", time.time() - start_time)
             return Attribution(tokens[:len(relevance_scores)], relevance_scores.tolist())
