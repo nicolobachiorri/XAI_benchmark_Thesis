@@ -359,48 +359,78 @@ def _lime_text(model, tokenizer):
     return explain
 
 # ==== SHAP ====
+# ==== SHAP ====
 def _kernel_shap(model, tokenizer):
-    """SHAP con TextExplainer - ultimo tentativo."""
+    """SHAP explainer – versione stabile (Text masker)."""
     if not SHAP_AVAILABLE:
         def explain(text: str) -> Attribution:
             return Attribution(["[NO_SHAP]"], [0.0])
         return explain
-    
+
+    # ------------------------------------------------------------- #
+    # Setup comune
+    # ------------------------------------------------------------- #
+    import torch, shap, numpy as np, time
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+
+    # ---------- funzione di predizione che restituisce np.ndarray --
+    def predict_fn(texts):
+        if isinstance(texts, str):
+            texts = [texts]
+
+        enc = tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128,
+        ).to(device)
+
+        with torch.no_grad():
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()  # (n, n_classi)
+        return probs
+
+    # ---------- masker testuale (evita bug string/float) -----------
+    masker = shap.maskers.Text(tokenizer)
+
+    # ---------- explainer una‑tantum (lo riusiamo) ------------------
+    explainer = shap.Explainer(predict_fn, masker)
+
+    # ------------------------------------------------------------- #
+    # Funzione explain restituita
+    # ------------------------------------------------------------- #
     def explain(text: str) -> Attribution:
         try:
-            # Funzione prediction semplice
-            def predict_fn(texts):
-                results = []
-                for t in texts:
-                    encoded = tokenizer(t, return_tensors="pt", truncation=True, max_length=128)
-                    encoded = models.move_batch_to_device(encoded)
-                    
-                    with torch.no_grad():
-                        outputs = model(**encoded)
-                        prob = torch.softmax(outputs.logits, dim=-1)[0][1].item()
-                    results.append(prob)
-                
-                return np.array(results)
-            
-            # Usa PartitionExplainer invece di Explainer
-            explainer = shap.PartitionExplainer(predict_fn, shap.maskers.Text())
-            shap_values = explainer([text], max_evals=100)
-            
-            # Estrai risultati  
-            words = text.split()
-            scores = shap_values.values[0]
-            
-            # Truncate to same length
-            min_len = min(len(words), len(scores))
-            return Attribution(words[:min_len], scores[:min_len].tolist())
-            
+            start = time.time()
+
+            # calcola valori SHAP (una sola istanza)
+            sv = explainer([text])
+
+            # tokenizzazione SHAP (può essere diversa da .split())
+            tokens = list(sv.data[0])                 # es. ['▁Hello', '▁world', '!']
+            values = sv.values
+
+            # se binary → values.shape = (1, n_tokens, 2)
+            if values.ndim == 3:                     # multi‑classe
+                # prendi la classe 1 (positiva) se binaria, altrimenti argmax
+                cls = 1 if values.shape[2] == 2 else int(np.argmax(predict_fn([text])[0]))
+                scores = values[0, :, cls]
+            else:                                    # regressione / logits scalari
+                scores = values[0]
+
+            return Attribution(tokens, scores.tolist())
+
         except Exception as e:
             print(f"[ERROR] SHAP failed: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             return Attribution(["[ERROR]"], [0.0])
-    
+
     return explain
+
+
+
 # ==== Factory ====
 _EXPLAINERS = {
     "grad_input": _grad_input,
