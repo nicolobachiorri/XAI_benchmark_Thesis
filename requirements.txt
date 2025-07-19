@@ -6,6 +6,7 @@ accelerate>=0.27.0
 # Data manipulation
 pandas>=2.2.2
 scikit-learn>=1.5.0
+numpy>=1.26.4
 scipy>=1.12.0
 
 # XAI methods
