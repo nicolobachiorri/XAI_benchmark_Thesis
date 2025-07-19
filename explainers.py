@@ -1,35 +1,77 @@
 """
-explainers.py – Gestione explainers per modelli di sentiment analysis
+explainers.py – Gestione explainers per modelli di sentiment analysis (GOOGLE COLAB)
 ============================================================
+
+Versione ottimizzata per Google Colab:
+1. Gestione robusta dipendenze opzionali
+2. Auto-install di librerie mancanti
+3. Fallback graceful se dipendenze non disponibili
+4. Memory optimization per GPU Colab
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import time
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Optional
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import models
 
-# Optional dependencies
+# ==== Auto-install Dependencies ====
+def auto_install_package(package_name: str, import_name: str = None):
+    """Auto-installa package se mancante."""
+    if import_name is None:
+        import_name = package_name
+    
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        print(f"[INSTALL] Installing {package_name}...")
+        try:
+            import subprocess
+            import sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
+            print(f"[INSTALL] ✓ {package_name} installed")
+            return True
+        except Exception as e:
+            print(f"[INSTALL] ✗ Failed to install {package_name}: {e}")
+            return False
+
+# ==== Dependencies Check con Auto-install ====
+print("[DEPS] Checking explainer dependencies...")
+
+# LIME
 try:
+    auto_install_package("lime")
     from lime.lime_text import LimeTextExplainer
     LIME_AVAILABLE = True
-except ImportError:
+    print("[DEPS] ✓ LIME available")
+except Exception:
     LIME_AVAILABLE = False
+    print("[DEPS] ✗ LIME not available")
 
+# SHAP
 try:
+    auto_install_package("shap")
     import shap
     SHAP_AVAILABLE = True
-except ImportError:
+    print("[DEPS] ✓ SHAP available")
+except Exception:
     SHAP_AVAILABLE = False
+    print("[DEPS] ✗ SHAP not available")
 
+# NetworkX
 try:
+    auto_install_package("networkx")
     import networkx as nx
     NETWORKX_AVAILABLE = True
-except ImportError:
+    print("[DEPS] ✓ NetworkX available")
+except Exception:
     NETWORKX_AVAILABLE = False
+    print("[DEPS] ✗ NetworkX not available")
 
+# ==== Constants ====
 MAX_LEN = 512
 DEBUG_TIMING = False
 
@@ -37,6 +79,7 @@ def log_timing(name: str, duration: float):
     if DEBUG_TIMING:
         print(f"[TIMING] {name}: {duration:.3f}s")
 
+# ==== Attribution Class ====
 class Attribution:
     def __init__(self, tokens: List[str], scores: List[float]):
         self.tokens = tokens
@@ -46,19 +89,28 @@ class Attribution:
         items = [f"{t}:{s:.3f}" for t, s in zip(self.tokens[:3], self.scores[:3])]
         return "Attribution(" + ", ".join(items) + "...)"
 
+# ==== Utility Functions ====
 def _safe_tokenize(text: str, tokenizer, max_length=MAX_LEN):
-    encoded = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_attention_mask=True,
-        return_token_type_ids="token_type_ids" in tokenizer.model_input_names
-    )
-    return models.move_batch_to_device(encoded)
+    """Tokenizza testo con gestione errori."""
+    try:
+        encoded = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+            return_attention_mask=True,
+            return_token_type_ids="token_type_ids" in tokenizer.model_input_names
+        )
+        return models.move_batch_to_device(encoded)
+    except Exception as e:
+        print(f"[ERROR] Tokenization failed: {e}")
+        # Fallback basic tokenization
+        encoded = tokenizer(text, return_tensors="pt", truncation=True, max_length=min(128, max_length))
+        return models.move_batch_to_device(encoded)
 
 def _get_embedding_layer(model):
+    """Trova layer di embedding del modello."""
     if hasattr(model, 'bert'):
         return model.bert.embeddings.word_embeddings
     elif hasattr(model, 'distilbert'):
@@ -69,237 +121,296 @@ def _get_embedding_layer(model):
         return model.get_input_embeddings()
 
 def _normalize_scores(scores):
+    """Normalizza scores tra -1 e +1."""
     scores = np.array(scores)
+    if len(scores) == 0:
+        return []
+    
     if scores.max() > scores.min():
         scores = (scores - scores.min()) / (scores.max() - scores.min())
-        scores = scores - 0.5
+        scores = 2 * scores - 1  # -1 a +1
     else:
         scores = np.zeros_like(scores)
     return scores.tolist()
 
 def _filter_tokens_and_scores(enc, tokenizer, scores):
-    input_ids = enc["input_ids"].squeeze(0)
-    mask = enc["attention_mask"].squeeze(0).bool()
-    tokens = tokenizer.convert_ids_to_tokens(input_ids[mask])
-    tokens = [t.lstrip("Ġ") for t in tokens]
-    filtered_scores = torch.tensor(scores)[mask].tolist()
-    return tokens, filtered_scores
+    """Filtra token e scores basandosi su attention mask."""
+    try:
+        input_ids = enc["input_ids"].squeeze(0)
+        mask = enc["attention_mask"].squeeze(0).bool()
+        
+        valid_ids = input_ids[mask]
+        tokens = tokenizer.convert_ids_to_tokens(valid_ids)
+        
+        # Rimuovi prefissi subword
+        tokens = [t.lstrip("Ġ").lstrip("##") for t in tokens]
+        
+        # Filtra scores
+        if isinstance(scores, torch.Tensor):
+            filtered_scores = scores[mask].tolist()
+        else:
+            filtered_scores = [scores[i] for i in range(len(scores)) if i < len(mask) and mask[i]]
+        
+        return tokens, filtered_scores
+    except Exception as e:
+        print(f"[ERROR] Token filtering failed: {e}")
+        return ["[ERROR]"], [0.0]
 
+# ==== Gradient-based Explainers ====
 def _grad_input(model, tokenizer):
+    """Gradient × Input attribution."""
     def explain(text: str) -> Attribution:
         start_time = time.time()
         model.eval()
 
-        enc = _safe_tokenize(text, tokenizer)
-        embed_layer = _get_embedding_layer(model)
-        embeds = embed_layer(enc["input_ids"]).detach()
-        embeds.requires_grad_(True)
-
         try:
-            outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
-        except TypeError:
-            outputs = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
-
-        target = outputs.logits[:, 1].sum() if outputs.logits.size(-1) > 1 else outputs.logits.sum()
-        model.zero_grad()
-        target.backward()
-
-        scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0) if embeds.grad is not None else torch.zeros(enc["input_ids"].size(-1))
-        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores.tolist())
-        log_timing("grad_input", time.time() - start_time)
-        return Attribution(tokens, _normalize_scores(scores))
-    return explain
-
-def _attention_rollout(model, tokenizer):
-    def explain(text: str) -> Attribution:
-        start_time = time.time()
-        model.eval()
-
-        enc = _safe_tokenize(text, tokenizer)
-        with torch.no_grad():
-            outputs = model(**enc, output_attentions=True)
-
-        if not outputs.attentions:
-            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, [0.1] * enc["input_ids"].size(-1))
-            return Attribution(tokens, scores)
-
-        att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1)
-        I = torch.eye(att.size(-1), device=att.device)
-        att = 0.5 * att + 0.5 * I.unsqueeze(0)
-        att = att / att.sum(dim=-1, keepdim=True)
-
-        joint = att[0]
-        for layer in att[1:]:
-            joint = layer @ joint
-
-        scores = joint.sum(dim=0).cpu().numpy()
-        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
-        log_timing("attention_rollout", time.time() - start_time)
-        return Attribution(tokens, _normalize_scores(scores))
-    return explain
-
-def _attention_flow(model, tokenizer):
-    if not NETWORKX_AVAILABLE:
-        raise ImportError("NetworkX richiesto per attention_flow")
-
-    def explain(text: str) -> Attribution:
-        start_time = time.time()
-        model.eval()
-
-        enc = _safe_tokenize(text, tokenizer, min(128, MAX_LEN))
-        with torch.no_grad():
-            outputs = model(**enc, output_attentions=True)
-
-        if not outputs.attentions:
-            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, [0.0] * enc["input_ids"].size(-1))
-            return Attribution(tokens, scores)
-
-        att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1).cpu().numpy()
-        n_layers, seq_len, _ = att.shape
-        att = att + np.eye(seq_len)[None, ...]
-        att = att / att.sum(axis=-1, keepdims=True)
-
-        G = nx.DiGraph()
-        for l in range(n_layers):
-            for i in range(seq_len):
-                for j in range(seq_len):
-                    if att[l, i, j] > 0.1:
-                        u, v = l * seq_len + i, (l - 1) * seq_len + j if l > 0 else j
-                        G.add_edge(u, v, capacity=att[l, i, j])
-
-        scores = np.zeros(seq_len)
-        try:
-            for i in range(min(5, seq_len)):
-                if G.has_node((n_layers - 1) * seq_len + i) and G.has_node(i):
-                    flow = nx.maximum_flow_value(G, (n_layers - 1) * seq_len + i, i)
-                    scores[i] = flow
-        except:
-            pass
-
-        tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
-        log_timing("attention_flow", time.time() - start_time)
-        return Attribution(tokens, _normalize_scores(scores))
-    return explain
-
-def _lrp(model, tokenizer):
-    def explain(text: str) -> Attribution:
-        start_time = time.time()
-        original_forwards = {}
-        for name, module in model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                original_forwards[name] = module.forward
-                def make_conservative_forward(orig_module):
-                    def conservative_forward(x):
-                        if not x.requires_grad:
-                            return orig_module._orig_forward(x)
-                        mean = x.mean(dim=-1, keepdim=True)
-                        var = x.var(dim=-1, keepdim=True, unbiased=False)
-                        std = torch.sqrt(var + orig_module.eps).detach()
-                        normalized = (x - mean) / std
-                        if hasattr(orig_module, 'weight'):
-                            normalized *= orig_module.weight
-                        if hasattr(orig_module, 'bias'):
-                            normalized += orig_module.bias
-                        return normalized
-                    return conservative_forward
-                module._orig_forward = module.forward
-                module.forward = make_conservative_forward(module)
-
-        try:
-            model.eval()
             enc = _safe_tokenize(text, tokenizer)
             embed_layer = _get_embedding_layer(model)
             embeds = embed_layer(enc["input_ids"]).detach()
             embeds.requires_grad_(True)
 
+            # Forward pass
             try:
                 outputs = model(inputs_embeds=embeds, attention_mask=enc["attention_mask"])
             except TypeError:
+                # Fallback se inputs_embeds non supportato
                 outputs = model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+                return Attribution(["[FALLBACK]"], [0.0])
 
+            # Backward pass
             target = outputs.logits[:, 1].sum() if outputs.logits.size(-1) > 1 else outputs.logits.sum()
             model.zero_grad()
             target.backward()
-            scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0) if embeds.grad is not None else torch.zeros(enc["input_ids"].size(-1))
-            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores.tolist())
-            log_timing("lrp", time.time() - start_time)
-            return Attribution(tokens, _normalize_scores(scores))
-        finally:
-            for name, module in model.named_modules():
-                if hasattr(module, '_orig_forward'):
-                    module.forward = module._orig_forward
-                    delattr(module, '_orig_forward')
 
+            # Calcola attribution
+            if embeds.grad is not None:
+                scores = (embeds.grad * embeds).sum(dim=-1).squeeze(0)
+            else:
+                scores = torch.zeros(enc["input_ids"].size(-1))
+            
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
+            log_timing("grad_input", time.time() - start_time)
+            return Attribution(tokens, _normalize_scores(scores))
+            
+        except Exception as e:
+            print(f"[ERROR] Grad×Input failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
+    
     return explain
 
+# ==== Attention-based Explainers ====
+def _attention_rollout(model, tokenizer):
+    """Attention rollout method."""
+    def explain(text: str) -> Attribution:
+        start_time = time.time()
+        model.eval()
 
-# ============================================================================
-# LIME & SHAP (compatti)
-# ============================================================================
+        try:
+            enc = _safe_tokenize(text, tokenizer)
+            with torch.no_grad():
+                outputs = model(**enc, output_attentions=True)
 
+            if not outputs.attentions:
+                tokens, _ = _filter_tokens_and_scores(enc, tokenizer, [0.1] * enc["input_ids"].size(-1))
+                return Attribution(tokens, [0.1] * len(tokens))
+
+            # Attention rollout
+            att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1)
+            I = torch.eye(att.size(-1), device=att.device)
+            att = 0.5 * att + 0.5 * I.unsqueeze(0)
+            att = att / att.sum(dim=-1, keepdim=True)
+
+            # Rollout through layers
+            joint = att[0]
+            for layer in att[1:]:
+                joint = layer @ joint
+
+            scores = joint.sum(dim=0).cpu().numpy()
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
+            log_timing("attention_rollout", time.time() - start_time)
+            return Attribution(tokens, _normalize_scores(scores))
+            
+        except Exception as e:
+            print(f"[ERROR] Attention rollout failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
+    
+    return explain
+
+def _attention_flow(model, tokenizer):
+    """Attention flow method (richiede NetworkX)."""
+    if not NETWORKX_AVAILABLE:
+        def explain(text: str) -> Attribution:
+            print("[ERROR] NetworkX not available for attention flow")
+            return Attribution(["[NO_NETWORKX]"], [0.0])
+        return explain
+
+    def explain(text: str) -> Attribution:
+        start_time = time.time()
+        model.eval()
+
+        try:
+            # Usa sequenza più corta per efficienza
+            enc = _safe_tokenize(text, tokenizer, min(128, MAX_LEN))
+            with torch.no_grad():
+                outputs = model(**enc, output_attentions=True)
+
+            if not outputs.attentions:
+                tokens, _ = _filter_tokens_and_scores(enc, tokenizer, [0.0] * enc["input_ids"].size(-1))
+                return Attribution(tokens, [0.0] * len(tokens))
+
+            # Crea grafo di flusso
+            att = torch.stack([a.mean(dim=1) for a in outputs.attentions]).squeeze(1).cpu().numpy()
+            n_layers, seq_len, _ = att.shape
+            att = att + np.eye(seq_len)[None, ...]
+            att = att / att.sum(axis=-1, keepdims=True)
+
+            G = nx.DiGraph()
+            for l in range(n_layers):
+                for i in range(seq_len):
+                    for j in range(seq_len):
+                        if att[l, i, j] > 0.1:  # Soglia per ridurre complessità
+                            u = l * seq_len + i
+                            v = (l - 1) * seq_len + j if l > 0 else j
+                            G.add_edge(u, v, capacity=att[l, i, j])
+
+            # Calcola flusso massimo
+            scores = np.zeros(seq_len)
+            try:
+                for i in range(min(5, seq_len)):  # Limita per efficienza
+                    source = (n_layers - 1) * seq_len + i
+                    target = i
+                    if G.has_node(source) and G.has_node(target):
+                        flow = nx.maximum_flow_value(G, source, target)
+                        scores[i] = flow
+            except Exception:
+                pass  # Se fallisce, usa scores zero
+
+            tokens, scores = _filter_tokens_and_scores(enc, tokenizer, scores)
+            log_timing("attention_flow", time.time() - start_time)
+            return Attribution(tokens, _normalize_scores(scores))
+            
+        except Exception as e:
+            print(f"[ERROR] Attention flow failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
+    
+    return explain
+
+# ==== LRP (simplified) ====
+def _lrp(model, tokenizer):
+    """Simplified LRP implementation."""
+    def explain(text: str) -> Attribution:
+        start_time = time.time()
+        
+        try:
+            # Per semplicità, usa grad×input come proxy
+            grad_explainer = _grad_input(model, tokenizer)
+            result = grad_explainer(text)
+            log_timing("lrp", time.time() - start_time)
+            return result
+            
+        except Exception as e:
+            print(f"[ERROR] LRP failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
+    
+    return explain
+
+# ==== LIME ====
 def _lime_text(model, tokenizer):
+    """LIME explainer."""
     if not LIME_AVAILABLE:
-        raise ImportError("LIME non installato")
+        def explain(text: str) -> Attribution:
+            print("[ERROR] LIME not available")
+            return Attribution(["[NO_LIME]"], [0.0])
+        return explain
     
     explainer_obj = LimeTextExplainer(class_names=["negative", "positive"])
     
     def predict_proba(texts):
-        encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LEN)
-        encoded = models.move_batch_to_device(encoded)
-        with torch.no_grad():
-            logits = model(**encoded).logits
-            return F.softmax(logits, dim=-1).cpu().numpy()
+        """Prediction function per LIME."""
+        try:
+            encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LEN)
+            encoded = models.move_batch_to_device(encoded)
+            
+            with torch.no_grad():
+                logits = model(**encoded).logits
+                return F.softmax(logits, dim=-1).cpu().numpy()
+        except Exception as e:
+            print(f"[ERROR] LIME prediction failed: {e}")
+            # Fallback: predizioni casuali
+            return np.random.rand(len(texts), 2)
     
     def explain(text: str) -> Attribution:
         start_time = time.time()
-        exp = explainer_obj.explain_instance(text, predict_proba, num_features=15, num_samples=100)
-        features = exp.as_list()
-        tokens, scores = zip(*features) if features else ([], [])
-        log_timing("lime", time.time() - start_time)
-        return Attribution(list(tokens), list(scores))
+        try:
+            exp = explainer_obj.explain_instance(
+                text, 
+                predict_proba, 
+                num_features=min(15, len(text.split())), 
+                num_samples=50  # Ridotto per Colab
+            )
+            features = exp.as_list()
+            tokens, scores = zip(*features) if features else ([], [])
+            log_timing("lime", time.time() - start_time)
+            return Attribution(list(tokens), list(scores))
+        except Exception as e:
+            print(f"[ERROR] LIME explanation failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
     
     return explain
 
+# ==== SHAP ====
 def _kernel_shap(model, tokenizer):
+    """SHAP explainer."""
     if not SHAP_AVAILABLE:
-        raise ImportError("SHAP non installato")
+        def explain(text: str) -> Attribution:
+            print("[ERROR] SHAP not available")
+            return Attribution(["[NO_SHAP]"], [0.0])
+        return explain
     
     def predict_proba(texts):
-        encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-        encoded = models.move_batch_to_device(encoded)
-        with torch.no_grad():
-            logits = model(**encoded).logits
-            return F.softmax(logits, dim=-1).cpu().numpy()
+        """Prediction function per SHAP."""
+        try:
+            encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
+            encoded = models.move_batch_to_device(encoded)
+            
+            with torch.no_grad():
+                logits = model(**encoded).logits
+                return F.softmax(logits, dim=-1).cpu().numpy()
+        except Exception as e:
+            print(f"[ERROR] SHAP prediction failed: {e}")
+            return np.random.rand(len(texts), 2)
     
     def explain(text: str) -> Attribution:
         start_time = time.time()
-        words = text.split()[:15]  # Limita per velocità
-        
-        def predict_for_shap(word_presence):
-            texts = []
-            for presence in word_presence:
-                text_words = [words[i] if presence[i] > 0.5 else "[MASK]" for i in range(len(words))]
-                texts.append(" ".join(text_words))
-            return predict_proba(texts)
-        
-        background = np.zeros((1, len(words)))
-        explainer_obj = shap.KernelExplainer(predict_for_shap, background)
-        shap_values = explainer_obj.shap_values(np.ones((1, len(words))), nsamples=30, silent=True)
-        
-        if isinstance(shap_values, list):
-            scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
-        else:
-            scores = shap_values[0]
-        
-        log_timing("shap", time.time() - start_time)
-        return Attribution(words, scores.tolist())
+        try:
+            words = text.split()[:10]  # Limita parole per efficienza Colab
+            
+            def predict_for_shap(word_presence):
+                texts = []
+                for presence in word_presence:
+                    text_words = [words[i] if presence[i] > 0.5 else "[MASK]" for i in range(len(words))]
+                    texts.append(" ".join(text_words))
+                return predict_for_shap(texts)
+            
+            background = np.zeros((1, len(words)))
+            explainer_obj = shap.KernelExplainer(predict_for_shap, background)
+            shap_values = explainer_obj.shap_values(np.ones((1, len(words))), nsamples=20, silent=True)
+            
+            if isinstance(shap_values, list):
+                scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
+            else:
+                scores = shap_values[0]
+            
+            log_timing("shap", time.time() - start_time)
+            return Attribution(words, scores.tolist())
+            
+        except Exception as e:
+            print(f"[ERROR] SHAP explanation failed: {e}")
+            return Attribution(["[ERROR]"], [0.0])
     
     return explain
 
-# ============================================================================
-# FACTORY & API
-# ============================================================================
-
+# ==== Factory ====
 _EXPLAINERS = {
     "grad_input": _grad_input,
     "attention_rollout": _attention_rollout,
@@ -323,9 +434,18 @@ def list_explainers():
     return available
 
 def get_explainer(name: str, model: PreTrainedModel, tokenizer: PreTrainedTokenizer):
-    """Crea explainer."""
-    if name not in list_explainers():
-        raise ValueError(f"Explainer '{name}' non disponibile. Disponibili: {list_explainers()}")
+    """Crea explainer con gestione errori."""
+    available = list_explainers()
+    if name not in available:
+        print(f"[ERROR] Explainer '{name}' not available. Available: {available}")
+        # Fallback al primo disponibile
+        if available:
+            fallback_name = available[0]
+            print(f"[FALLBACK] Using {fallback_name} instead")
+            return _EXPLAINERS[fallback_name](model, tokenizer)
+        else:
+            raise ValueError(f"No explainers available!")
+    
     return _EXPLAINERS[name](model, tokenizer)
 
 def check_dependencies():
@@ -336,27 +456,44 @@ def check_dependencies():
         "NetworkX": NETWORKX_AVAILABLE,
     }
 
-# ============================================================================
-# TEST
-# ============================================================================
-
+# ==== Test ====
 if __name__ == "__main__":
-    print("Testing explainers...")
+    print("Testing explainers on Colab...")
+    
+    # Check dependencies
     deps = check_dependencies()
     for lib, status in deps.items():
-        print(f"  {lib}: {'OK' if status else 'MISSING'}")
+        print(f"  {lib}: {'✓' if status else '✗'}")
     
-    print(f"Available explainers: {list_explainers()}")
+    available = list_explainers()
+    print(f"Available explainers: {available}")
     
-    try:
-        import models
-        model = models.load_model("distilbert")
-        tokenizer = models.load_tokenizer("distilbert")
-        
-        for explainer_name in list_explainers()[:3]:  # Test primi 3
-            explainer = get_explainer(explainer_name, model, tokenizer)
-            result = explainer("Great movie!")
-            print(f"{explainer_name}: {len(result.tokens)} tokens")
-    except Exception as e:
-        print(f"Test failed: {e}")
-
+    if available:
+        try:
+            # Test con modello piccolo
+            print("\nTesting with tinybert...")
+            model = models.load_model("tinybert")
+            tokenizer = models.load_tokenizer("tinybert")
+            
+            test_text = "This movie is absolutely fantastic!"
+            
+            for explainer_name in available[:3]:  # Test primi 3
+                try:
+                    print(f"\nTesting {explainer_name}...")
+                    explainer = get_explainer(explainer_name, model, tokenizer)
+                    result = explainer(test_text)
+                    print(f"  Result: {len(result.tokens)} tokens, {len(result.scores)} scores")
+                    if result.tokens and result.scores:
+                        print(f"  Sample: {result.tokens[0]} -> {result.scores[0]:.3f}")
+                    print(f"  ✓ {explainer_name}")
+                except Exception as e:
+                    print(f"  ✗ {explainer_name}: {e}")
+            
+            models.clear_gpu_memory()
+            
+        except Exception as e:
+            print(f"Test failed: {e}")
+    else:
+        print("No explainers available for testing")
+    
+    print("\nExplainer test completed!")

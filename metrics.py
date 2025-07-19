@@ -1,69 +1,51 @@
 """
-metrics.py – Metriche del paper XAI (con Consistency corretta)
+metrics.py – Metriche XAI ottimizzate per Google Colab con dataset clusterizzato
 ============================================================
 
-Implementa **tre metriche automatiche** tratte da "Evaluating the effectiveness
-of XAI techniques for encoder-based language models".
+OTTIMIZZAZIONI PER COLAB:
+1. Adattato per dataset ridotto (400 esempi)
+2. Memory-efficient computation
+3. Progress tracking ottimizzato
+4. Inference seed consistency più veloce
+5. Batch processing per GPU efficiency
 
-1. **Robustness** – stabilità delle saliency sotto perturbazione del testo
-2. **Consistency** – stabilità dell'explainer con inference seed diversi (CORRETTA)
-3. **Contrastivity** – diversità delle saliency fra classi opposte
-
-La metrica di *Human-reasoning Agreement* non è implementata perché richiede
-annotazioni manuali.
-
-AGGIORNAMENTO: Consistency ora usa inference seed invece di modelli diversi.
+Metriche implementate:
+- Robustness: stabilità sotto perturbazioni
+- Consistency: stabilità con inference seed diversi  
+- Contrastivity: diversità tra classi opposte
 """
 
-# ==== 1. Librerie ====
-from __future__ import annotations
-from typing import List, Callable, Sequence, Tuple, Optional
-from explainers import Attribution 
 import random
 import numpy as np
 import torch
 import torch.nn.functional as F
+from typing import List, Callable, Tuple, Optional
 from transformers import PreTrainedModel, PreTrainedTokenizer
-from scipy.stats import spearmanr, entropy  # Spearman ρ, KL divergence
+from scipy.stats import spearmanr, entropy
 from tqdm import tqdm
+from explainers import Attribution
+import models
 
-# ==== 2. Parametri configurabili ====
+# ==== Parametri ottimizzati per Colab ====
 DEFAULT_PERTURBATION_RATIO = 0.15
-MIN_SHARED_TOKENS = 2  # Minimo numero di token condivisi per calcolare correlazione
+MIN_SHARED_TOKENS = 2
 RANDOM_STATE = 42
 
-# Parametri per consistency con inference seed
-DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
+# Parametri consistency (ottimizzati per Colab)
+DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]  # 4 seed come richiesto
+MAX_CONSISTENCY_SAMPLES = 50  # Limite per consistency
 
-# ==== 3. Helper per gestione probabilità ====
+# ==== Memory-efficient Helper Functions ====
+def clear_memory_if_needed():
+    """Cleanup memoria se necessario."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        if allocated > 8.0:  # Se >8GB, cleanup
+            models.clear_gpu_memory()
 
-def _get_positive_prob(model: PreTrainedModel, input_ids: torch.Tensor, attn_mask: torch.Tensor) -> float:
-    """Calcola la probabilità della classe positiva in modo robusto."""
-    try:
-        # FIX: Assicura che input siano su GPU
-        import models
-        input_ids = input_ids.to(models.DEVICE)
-        attn_mask = attn_mask.to(models.DEVICE)
-        
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attn_mask)
-            logits = outputs.logits
-            
-            if logits.size(-1) > 1:
-                # Classificazione binaria: applica softmax e prendi classe 1
-                probs = F.softmax(logits, dim=-1)
-                return probs[:, 1].item()
-            else:
-                # Output singolo: applica sigmoid
-                return torch.sigmoid(logits.squeeze(-1)).item()
-    except Exception as e:
-        print(f"Errore in _get_positive_prob: {e}")
-        return 0.5  # Fallback: probabilità neutra
-    
-# ==== 4. Funzioni di perturbazione ====
-
+# ==== Perturbation Functions (ottimizzate) ====
 def _random_mask(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO, mask_token: str = "[MASK]") -> str:
-    """Maschera ~ratio% delle parole con un token speciale."""
+    """Maschera parole casuali."""
     if not text.strip():
         return text
     
@@ -72,19 +54,18 @@ def _random_mask(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO, mask_toke
         return text
     
     n_to_mask = max(1, int(len(tokens) * ratio))
-    n_to_mask = min(n_to_mask, len(tokens) - 1)  # Lascia almeno una parola
+    n_to_mask = min(n_to_mask, len(tokens) - 1)
     
     try:
         idx_to_mask = random.sample(range(len(tokens)), n_to_mask)
         for i in idx_to_mask:
             tokens[i] = mask_token
         return " ".join(tokens)
-    except Exception as e:
-        print(f"Errore in _random_mask: {e}")
+    except Exception:
         return text
 
 def _random_delete(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> str:
-    """Elimina ~ratio% delle parole casualmente."""
+    """Elimina parole casuali."""
     if not text.strip():
         return text
     
@@ -93,27 +74,21 @@ def _random_delete(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> str:
         return text
     
     n_to_delete = max(1, int(len(tokens) * ratio))
-    n_to_delete = min(n_to_delete, len(tokens) - 1)  # Lascia almeno una parola
+    n_to_delete = min(n_to_delete, len(tokens) - 1)
     
     try:
         idx_to_keep = random.sample(range(len(tokens)), len(tokens) - n_to_delete)
         idx_to_keep.sort()
         return " ".join(tokens[i] for i in idx_to_keep)
-    except Exception as e:
-        print(f"Errore in _random_delete: {e}")
+    except Exception:
         return text
 
 def _random_substitute(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> str:
-    """Sostituisce ~ratio% delle parole con sinonimi semplici."""
-    if not text.strip():
-        return text
-    
-    # Dizionario semplice di sostituzioni
+    """Sostituisce parole con sinonimi."""
     substitutions = {
         "good": "great", "bad": "terrible", "nice": "pleasant", "awful": "horrible",
         "love": "like", "hate": "dislike", "amazing": "wonderful", "terrible": "bad",
-        "excellent": "good", "poor": "bad", "fantastic": "great", "boring": "dull",
-        "interesting": "engaging", "stupid": "foolish", "smart": "clever", "funny": "amusing"
+        "excellent": "good", "poor": "bad", "fantastic": "great", "boring": "dull"
     }
     
     tokens = text.split()
@@ -121,75 +96,50 @@ def _random_substitute(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> 
         return text
     
     n_to_substitute = max(1, int(len(tokens) * ratio))
-    n_to_substitute = min(n_to_substitute, len(tokens))
     
     try:
-        idx_to_substitute = random.sample(range(len(tokens)), n_to_substitute)
+        idx_to_substitute = random.sample(range(len(tokens)), min(n_to_substitute, len(tokens)))
         for i in idx_to_substitute:
             word = tokens[i].lower()
             if word in substitutions:
                 tokens[i] = substitutions[word]
         return " ".join(tokens)
-    except Exception as e:
-        print(f"Errore in _random_substitute: {e}")
+    except Exception:
         return text
 
-# Lista delle funzioni di perturbazione disponibili
 PERTURBATION_FUNCTIONS = [_random_mask, _random_delete, _random_substitute]
 
-# ==== 5. Robustness ====
-
+# ==== 1. ROBUSTNESS (ottimizzata) ====
 def compute_robustness(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     explainer: Callable[[str], Attribution],
     text: str,
-    perturb_fn: Optional[Callable[[str], str]] = None,
-    n_perturbations: int = 3,
+    n_perturbations: int = 2  # Ridotto da 3 per velocità
 ) -> float:
-    """
-    Calcola la robustness come Mean Average Difference (MAD) fra saliency
-    originali e perturbate.
-    
-    Args:
-        model: Modello pre-trained
-        tokenizer: Tokenizer corrispondente
-        explainer: Funzione che genera Attribution
-        text: Testo da analizzare
-        perturb_fn: Funzione di perturbazione (None = usa tutte)
-        n_perturbations: Numero di perturbazioni per funzione
-    
-    Returns:
-        float: MAD score (più basso = più robusto)
-    """
+    """Calcola robustness con meno perturbazioni."""
     try:
-        # Calcola attribution originale
+        # Attribution originale
         orig_attr = explainer(text)
         if not orig_attr.tokens or not orig_attr.scores:
             return 0.0
         
-        # Scegli funzioni di perturbazione
-        if perturb_fn is None:
-            perturb_functions = PERTURBATION_FUNCTIONS
-        else:
-            perturb_functions = [perturb_fn]
-        
         all_diffs = []
         
-        for perturb_func in perturb_functions:
+        for perturb_func in PERTURBATION_FUNCTIONS:
             for _ in range(n_perturbations):
                 try:
-                    # Genera testo perturbato
+                    # Perturbazione
                     pert_text = perturb_func(text)
-                    if pert_text == text:  # Skip se perturbazione non ha effetto
+                    if pert_text == text:
                         continue
                     
-                    # Calcola attribution perturbata
+                    # Attribution perturbata
                     pert_attr = explainer(pert_text)
                     if not pert_attr.tokens or not pert_attr.scores:
                         continue
                     
-                    # Allinea token comuni
+                    # Calcola differenze per token condivisi
                     score_diffs = []
                     for tok, score in zip(orig_attr.tokens, orig_attr.scores):
                         if tok in pert_attr.tokens:
@@ -200,18 +150,45 @@ def compute_robustness(
                     if score_diffs:
                         all_diffs.extend(score_diffs)
                         
-                except Exception as e:
-                    print(f"Errore in perturbazione: {e}")
+                except Exception:
                     continue
         
         return float(np.mean(all_diffs)) if all_diffs else 0.0
         
-    except Exception as e:
-        print(f"Errore in compute_robustness: {e}")
+    except Exception:
         return 0.0
 
-# ==== 6. Consistency (CORRETTA CON INFERENCE SEED) ====
+def evaluate_robustness_over_dataset(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    show_progress: bool = True,
+) -> float:
+    """Valuta robustness su dataset con progress tracking."""
+    try:
+        robustness_scores = []
+        iterator = tqdm(texts, desc="Robustness", leave=False) if show_progress else texts
+        
+        for i, text in enumerate(iterator):
+            try:
+                if text.strip():
+                    score = compute_robustness(model, tokenizer, explainer, text)
+                    robustness_scores.append(score)
+                
+                # Cleanup periodico
+                if i % 50 == 0:
+                    clear_memory_if_needed()
+                    
+            except Exception:
+                continue
+        
+        return float(np.mean(robustness_scores)) if robustness_scores else 0.0
+        
+    except Exception:
+        return 0.0
 
+# ==== 2. CONSISTENCY (ottimizzata con inference seed) ====
 def compute_consistency_inference_seed(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -220,61 +197,41 @@ def compute_consistency_inference_seed(
     seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
     show_progress: bool = True
 ) -> float:
-    """
-    Calcola consistency usando inference seed diversi (approccio corretto).
+    """Consistency con inference seed (ottimizzata per Colab)."""
     
-    Invece di confrontare modelli diversi, confronta lo stesso modello+explainer
-    con seed diversi per l'inferenza, attivando dropout per stocasticità.
-    
-    Args:
-        model: Modello pre-trained
-        tokenizer: Tokenizer corrispondente
-        explainer: Funzione explainer
-        texts: Lista di testi da analizzare
-        seeds: Lista di seed per inferenza stocastica
-        show_progress: Se mostrare progress
-    
-    Returns:
-        float: Correlazione di Spearman media tra tutte le coppie di seed
-    """
+    # Limita testi per consistency (computazionalmente intensiva)
+    if len(texts) > MAX_CONSISTENCY_SAMPLES:
+        texts = texts[:MAX_CONSISTENCY_SAMPLES]
+        if show_progress:
+            print(f"[CONSISTENCY] Limited to {MAX_CONSISTENCY_SAMPLES} samples for efficiency")
     
     if show_progress:
-        print(f"Computing consistency with {len(seeds)} inference seeds...")
+        print(f"[CONSISTENCY] Computing with {len(seeds)} seeds on {len(texts)} texts...")
     
-    # ATTIVA training mode per dropout stocastico
+    # Attiva training mode per dropout
     original_mode = model.training
     model.train()
     
-    # DISATTIVA gradient computation (non vogliamo fine-tuning)
+    # Disabilita gradients
     original_requires_grad = {}
     for name, param in model.named_parameters():
         original_requires_grad[name] = param.requires_grad
         param.requires_grad_(False)
     
-    if show_progress:
-        print(f"  Model set to training mode (dropout active)")
-        # Mostra se ci sono layer dropout
-        dropout_layers = [name for name, module in model.named_modules() 
-                         if isinstance(module, torch.nn.Dropout)]
-        if dropout_layers:
-            print(f"  Found {len(dropout_layers)} dropout layers")
-        else:
-            print(f"  WARNING: No dropout layers found - consistency might be perfect")
-    
     try:
-        # Genera explanations per ogni inference seed
+        # Genera explanations per ogni seed
         explanations_by_seed = {}
         
         for seed in seeds:
             if show_progress:
-                print(f"  Processing inference seed {seed}...")
+                print(f"  [SEED] Processing {seed}...")
             
             explanations = []
             text_iterator = tqdm(texts, desc=f"Seed {seed}", leave=False) if show_progress else texts
             
             for text in text_iterator:
                 try:
-                    # Imposta seed prima di ogni explanation per dropout stocastico
+                    # Set seed per dropout stocastico
                     random.seed(seed)
                     np.random.seed(seed)
                     torch.manual_seed(seed)
@@ -283,40 +240,38 @@ def compute_consistency_inference_seed(
                     
                     attr = explainer(text)
                     explanations.append(attr)
-                except Exception as e:
-                    if show_progress:
-                        print(f"    Error on text: {e}")
-                    # Aggiungi attribution vuota
+                    
+                except Exception:
                     explanations.append(Attribution([], []))
             
             explanations_by_seed[seed] = explanations
+            
+            # Cleanup dopo ogni seed
+            clear_memory_if_needed()
         
-        # Calcola consistency tra tutte le coppie di seed
-        consistency_scores = []
+        # Calcola correlazioni tra tutte le coppie di seed
+        correlations = []
         
         for i, seed_a in enumerate(seeds):
-            for j, seed_b in enumerate(seeds[i+1:], i+1):
+            for seed_b in seeds[i+1:]:
                 if show_progress:
-                    print(f"  Comparing seeds {seed_a} vs {seed_b}...")
+                    print(f"  [CORR] Computing {seed_a} vs {seed_b}...")
                 
                 correlation = _compute_spearman_correlation_explanations(
                     explanations_by_seed[seed_a],
                     explanations_by_seed[seed_b]
                 )
-                consistency_scores.append(correlation)
+                correlations.append(correlation)
         
-        # Media di tutte le correlazioni
-        final_consistency = float(np.mean(consistency_scores)) if consistency_scores else 0.0
+        final_consistency = float(np.mean(correlations)) if correlations else 0.0
         
         if show_progress:
-            print(f"  Final consistency: {final_consistency:.4f}")
-            if final_consistency > 0.99:
-                print(f"  NOTE: Very high consistency - model might not have significant dropout")
+            print(f"  [RESULT] Consistency: {final_consistency:.4f}")
         
         return final_consistency
         
     finally:
-        # Ripristina stato originale del modello
+        # Ripristina stato modello
         model.train(original_mode)
         for name, param in model.named_parameters():
             param.requires_grad_(original_requires_grad[name])
@@ -325,20 +280,15 @@ def _compute_spearman_correlation_explanations(
     explanations_a: List[Attribution],
     explanations_b: List[Attribution]
 ) -> float:
-    """
-    Calcola correlazione di Spearman tra due liste di explanations.
-    """
+    """Calcola correlazione di Spearman tra explanations."""
     correlations = []
     
     for attr_a, attr_b in zip(explanations_a, explanations_b):
-        # Skip se una delle attribution è vuota
         if not attr_a.tokens or not attr_b.tokens:
             continue
         
-        # Allinea token comuni
+        # Trova token condivisi
         shared_scores_a, shared_scores_b = [], []
-        
-        # Usa set per lookup più veloce
         tokens_b_set = set(attr_b.tokens)
         token_to_idx_b = {tok: i for i, tok in enumerate(attr_b.tokens)}
         
@@ -348,13 +298,11 @@ def _compute_spearman_correlation_explanations(
                 shared_scores_a.append(score_a)
                 shared_scores_b.append(attr_b.scores[idx])
         
-        # Calcola correlazione se ci sono abbastanza token condivisi
+        # Calcola correlazione se abbastanza token condivisi
         if len(shared_scores_a) >= MIN_SHARED_TOKENS:
-            # Converti in numpy per calcolo più veloce
             arr_a = np.array(shared_scores_a)
             arr_b = np.array(shared_scores_b)
             
-            # Gestisci varianza zero
             if np.var(arr_a) == 0 or np.var(arr_b) == 0:
                 correlation = 1.0 if np.array_equal(arr_a, arr_b) else 0.0
             else:
@@ -368,8 +316,7 @@ def _compute_spearman_correlation_explanations(
     
     return np.mean(correlations) if correlations else 0.0
 
-# ==== 7. Consistency (Solo Inference Seed) ====
-
+# Wrapper per compatibilità
 def compute_consistency(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -378,20 +325,7 @@ def compute_consistency(
     seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
     show_progress: bool = False
 ) -> float:
-    """
-    Calcola consistency usando inference seed diversi.
-    
-    Args:
-        model: Modello da testare
-        tokenizer: Tokenizer del modello
-        explainer: Explainer da testare
-        texts: Testi da analizzare
-        seeds: Seed per inferenza stocastica
-        show_progress: Se mostrare progress
-    
-    Returns:
-        float: Consistency score (correlazione di Spearman media)
-    """
+    """Wrapper per consistency."""
     return compute_consistency_inference_seed(
         model=model,
         tokenizer=tokenizer,
@@ -401,10 +335,27 @@ def compute_consistency(
         show_progress=show_progress
     )
 
-# ==== 8. Contrastivity ====
+def evaluate_consistency_over_dataset(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
+    show_progress: bool = True
+) -> float:
+    """Wrapper per consistency evaluation."""
+    return compute_consistency_inference_seed(
+        model=model,
+        tokenizer=tokenizer,
+        explainer=explainer,
+        texts=texts,
+        seeds=seeds,
+        show_progress=show_progress
+    )
 
-def _normalize_scores(scores: Sequence[float]) -> np.ndarray:
-    """Normalizza i punteggi per formare una distribuzione di probabilità."""
+# ==== 3. CONTRASTIVITY (ottimizzata) ====
+def _normalize_scores_for_distribution(scores: List[float]) -> np.ndarray:
+    """Normalizza scores per distribuzione di probabilità."""
     arr = np.array(scores, dtype=float)
     
     # Sposta a valori non-negativi
@@ -413,7 +364,7 @@ def _normalize_scores(scores: Sequence[float]) -> np.ndarray:
     # Normalizza
     total = np.sum(arr)
     if total == 0:
-        return np.ones(len(arr)) / len(arr)  # Distribuzione uniforme
+        return np.ones(len(arr)) / len(arr)
     
     return arr / total
 
@@ -422,267 +373,145 @@ def compute_contrastivity(
     negative_attrs: List[Attribution],
     use_jensen_shannon: bool = False,
 ) -> float:
-    """
-    Calcola la contrastivity come divergenza KL tra distribuzioni medie
-    di importanza delle due classi.
-    
-    Args:
-        positive_attrs: Lista di Attribution per esempi positivi
-        negative_attrs: Lista di Attribution per esempi negativi
-        use_jensen_shannon: Se True usa Jensen-Shannon invece di KL
-    
-    Returns:
-        float: Divergenza (più alto = feature più diverse tra classi)
-    """
+    """Calcola contrastivity con gestione memoria."""
     try:
         if not positive_attrs or not negative_attrs:
             return 0.0
         
-        # Raccogli tutti i token e i loro punteggi
+        # Accumula token scores per classe
         token_scores_pos = {}
         token_scores_neg = {}
         
         def accumulate_scores(score_dict: dict, attr: Attribution):
             for tok, score in zip(attr.tokens, attr.scores):
-                if tok.strip() and tok not in ['[CLS]', '[SEP]', '[PAD]']:
+                if tok.strip() and tok not in ['[CLS]', '[SEP]', '[PAD]', '[ERROR]']:
                     score_dict[tok] = score_dict.get(tok, 0.0) + score
         
-        # Accumula punteggi per classe
+        # Accumula scores
         for attr in positive_attrs:
             accumulate_scores(token_scores_pos, attr)
         for attr in negative_attrs:
             accumulate_scores(token_scores_neg, attr)
         
-        # Crea vocabolario unificato
+        # Vocabolario unificato
         vocab = set(token_scores_pos.keys()) | set(token_scores_neg.keys())
         if len(vocab) < 2:
             return 0.0
         
-        vocab = sorted(vocab)  # Ordine consistente
+        vocab = sorted(vocab)[:1000]  # Limita per memoria
         
-        # Calcola distribuzioni medie
+        # Distribuzioni
         pos_scores = [token_scores_pos.get(tok, 0.0) for tok in vocab]
         neg_scores = [token_scores_neg.get(tok, 0.0) for tok in vocab]
         
-        # Normalizza per creare distribuzioni di probabilità
-        p = _normalize_scores(pos_scores)
-        q = _normalize_scores(neg_scores)
+        p = _normalize_scores_for_distribution(pos_scores)
+        q = _normalize_scores_for_distribution(neg_scores)
         
         # Calcola divergenza
         if use_jensen_shannon:
-            # Jensen-Shannon divergence (simmetrica)
             m = 0.5 * (p + q)
             js_div = 0.5 * entropy(p, m, base=2) + 0.5 * entropy(q, m, base=2)
             return float(js_div)
         else:
-            # KL divergence standard
-            # Aggiungi epsilon per evitare log(0)
             epsilon = 1e-10
             q_smooth = q + epsilon
             kl_div = entropy(p, q_smooth, base=2)
             return float(kl_div)
             
-    except Exception as e:
-        print(f"Errore in compute_contrastivity: {e}")
+    except Exception:
         return 0.0
 
-
-
-# Vocabolario: ["great", "terrible", "movie", "film"]
-# Positive: great=0.8, terrible=0.0, movie=0.2, film=0.1
-# Negative: great=0.0, terrible=0.9, movie=0.2, film=0.1
-
-# Dopo normalizzazione:
-# p = [0.73, 0.0, 0.18, 0.09]  # Classe positiva
-# q = [0.0, 0.75, 0.17, 0.08]  # Classe negativa
-
-# KL Divergence:
-# KL = 0.73 * log2(0.73/0.00001) + 0.0 * log2(...) + 0.18 * log2(0.18/0.17) + 0.09 * log2(0.09/0.08)
-# KL = 0.73 * 16.49 + 0 + 0.18 * 0.08 + 0.09 * 0.17
-# KL = 12.04 + 0 + 0.014 + 0.015 = 12.07
-
-# Contrastivity = 12.07 (ALTO = molto contrastivo)
-
-# ==== 9. Funzioni batch per valutazione su dataset ====
-
-def evaluate_robustness_over_dataset(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
+# ==== Batch Processing Utilities ====
+def process_attributions_batch(
+    texts: List[str], 
     explainer: Callable[[str], Attribution],
-    texts: List[str],
-    sample_size: Optional[int] = None,
-    show_progress: bool = True,
-) -> float:
-    """
-    Valuta robustness su un dataset di testi.
+    batch_size: int = 10,
+    show_progress: bool = True
+) -> List[Attribution]:
+    """Processa attributions in batch con memory management."""
+    results = []
     
-    Args:
-        model, tokenizer, explainer: Componenti del modello
-        texts: Lista di testi da valutare
-        sample_size: Numero di esempi da campionare (None = tutti)
-        show_progress: Se mostrare barra di progresso
+    # Dividi in batch
+    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+    iterator = tqdm(batches, desc="Processing batch", leave=False) if show_progress else batches
     
-    Returns:
-        float: Media delle robustness individuali
-    """
-    try:
-        # Campiona se necessario
-        if sample_size and sample_size < len(texts):
-            texts = random.sample(texts, sample_size)
-        
-        # Calcola robustness per ogni testo
-        robustness_scores = []
-        iterator = tqdm(texts, desc="Robustness") if show_progress else texts
-        
-        for text in iterator:
+    for batch in iterator:
+        batch_results = []
+        for text in batch:
             try:
-                if text.strip():  # Skip testi vuoti
-                    score = compute_robustness(model, tokenizer, explainer, text)
-                    robustness_scores.append(score)
-            except Exception as e:
-                print(f"Errore su testo: {e}")
-                continue
+                attr = explainer(text)
+                batch_results.append(attr)
+            except Exception:
+                batch_results.append(Attribution([], []))
         
-        return float(np.mean(robustness_scores)) if robustness_scores else 0.0
+        results.extend(batch_results)
         
-    except Exception as e:
-        print(f"Errore in evaluate_robustness_over_dataset: {e}")
-        return 0.0
-
-def evaluate_consistency_over_dataset(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    sample_size: Optional[int] = None,
-    show_progress: bool = True,
-    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS
-) -> float:
-    """
-    Valuta consistency su dataset usando inference seed.
+        # Cleanup ogni batch
+        clear_memory_if_needed()
     
-    Args:
-        model: Modello da testare
-        tokenizer: Tokenizer del modello
-        explainer: Explainer da testare
-        texts: Lista di testi
-        sample_size: Numero di esempi (None = tutti)
-        show_progress: Se mostrare progress
-        seeds: Seed per inferenza stocastica
-    
-    Returns:
-        float: Consistency score media
-    """
-    return compute_consistency_inference_seed(
-        model=model,
-        tokenizer=tokenizer,
-        explainer=explainer,
-        texts=texts[:sample_size] if sample_size else texts,
-        seeds=seeds,
-        show_progress=show_progress
-    )
+    return results
 
-# ==== 10. Utility per debugging ====
-
+# ==== Summary Function ====
 def print_metric_summary(
     robustness_score: float,
     consistency_score: float,
     contrastivity_score: float,
 ):
-    """Stampa un riassunto delle metriche calcolate."""
-    print("\n=== SUMMARY METRICHE XAI ===")
-    print(f"Robustness:    {robustness_score:.4f} (piu basso = piu robusto)")
-    print(f"Consistency:   {consistency_score:.4f} (piu alto = piu consistente)")
-    print(f"Contrastivity: {contrastivity_score:.4f} (piu alto = piu contrastivo)")
-    print("==============================\n")
+    """Stampa summary metriche."""
+    print("\n" + "="*50)
+    print("XAI METRICS SUMMARY")
+    print("="*50)
+    print(f"Robustness:    {robustness_score:.4f} (lower = more robust)")
+    print(f"Consistency:   {consistency_score:.4f} (higher = more consistent)")
+    print(f"Contrastivity: {contrastivity_score:.4f} (higher = more contrastive)")
+    print("="*50)
 
-def test_inference_seed_effect():
-    """Test per verificare che l'inference seed abbia effetto."""
-    print("Testing inference seed effect...")
-    
-    try:
-        import models
-        model = models.load_model("distilbert")
-        tokenizer = models.load_tokenizer("distilbert")
-        
-        test_text = "This movie is great!"
-        encoded = tokenizer(test_text, return_tensors="pt", max_length=50, truncation=True)
-        
-        # Test in eval mode
-        model.eval()
-        random.seed(42)
-        np.random.seed(42)
-        torch.manual_seed(42)
-        output1 = model(**encoded).logits
-        
-        random.seed(123)
-        np.random.seed(123)
-        torch.manual_seed(123)
-        output2 = model(**encoded).logits
-        
-        eval_identical = torch.allclose(output1, output2, atol=1e-6)
-        print(f"  Eval mode - Identical outputs: {eval_identical}")
-        
-        # Test in training mode
-        model.train()
-        for param in model.parameters():
-            param.requires_grad_(False)
-        
-        random.seed(42)
-        np.random.seed(42)
-        torch.manual_seed(42)
-        output1 = model(**encoded).logits
-        
-        random.seed(123)
-        np.random.seed(123)
-        torch.manual_seed(123)
-        output2 = model(**encoded).logits
-        
-        train_identical = torch.allclose(output1, output2, atol=1e-6)
-        print(f"  Training mode - Identical outputs: {train_identical}")
-        
-        if eval_identical and not train_identical:
-            print("  Inference seed is working correctly")
-            return True
-        elif eval_identical and train_identical:
-            print("  WARNING: Dropout might not be significant enough")
-            return False
-        else:
-            print("  Unexpected behavior")
-            return False
-            
-    except Exception as e:
-        print(f"  Test failed: {e}")
-        return False
-
-# ==== 11. Test di compatibilità ====
+# ==== Test Function ====
 if __name__ == "__main__":
-    print("Testing metrics...")
+    print("Testing metrics on Colab...")
     
-    # Test funzioni di perturbazione
-    test_text = "This movie was absolutely fantastic and I loved every minute of it!"
+    # Test con modello piccolo
+    try:
+        model = models.load_model("tinybert")
+        tokenizer = models.load_tokenizer("tinybert")
+        
+        # Mock explainer per test
+        def mock_explainer(text):
+            tokens = text.split()[:5]
+            scores = np.random.rand(len(tokens)).tolist()
+            return Attribution(tokens, scores)
+        
+        test_texts = [
+            "This movie is great!",
+            "This movie is terrible.",
+            "An okay film."
+        ]
+        
+        print("\nTesting Robustness...")
+        robustness = evaluate_robustness_over_dataset(
+            model, tokenizer, mock_explainer, test_texts, show_progress=False
+        )
+        print(f"Robustness: {robustness:.4f}")
+        
+        print("\nTesting Consistency...")
+        consistency = evaluate_consistency_over_dataset(
+            model, tokenizer, mock_explainer, test_texts[:2], 
+            seeds=[42, 123], show_progress=False
+        )
+        print(f"Consistency: {consistency:.4f}")
+        
+        print("\nTesting Contrastivity...")
+        pos_attrs = [mock_explainer(test_texts[0])]
+        neg_attrs = [mock_explainer(test_texts[1])]
+        contrastivity = compute_contrastivity(pos_attrs, neg_attrs)
+        print(f"Contrastivity: {contrastivity:.4f}")
+        
+        print_metric_summary(robustness, consistency, contrastivity)
+        
+        print("\n✓ Metrics test completed!")
+        
+    except Exception as e:
+        print(f"Test failed: {e}")
     
-    print(f"Originale: {test_text}")
-    print(f"Masked: {_random_mask(test_text)}")
-    print(f"Deleted: {_random_delete(test_text)}")
-    print(f"Substituted: {_random_substitute(test_text)}")
-    
-    # Test normalizzazione
-    print("\nTesting normalization...")
-    test_scores = [0.5, -0.2, 0.8, 0.1, -0.1]
-    normalized = _normalize_scores(test_scores)
-    print(f"Originali: {test_scores}")
-    print(f"Normalizzati: {normalized}")
-    print(f"Somma: {np.sum(normalized)}")
-    
-    # Test inference seed effect
-    print("\nTesting inference seed effect...")
-    test_inference_seed_effect()
-    
-    print("\nMetrics test completato!")
-    print("\nNOTE: Consistency ora usa solo inference seed approach:")
-    print("1. compute_consistency(model, tokenizer, explainer, texts, seeds)")
-    print("2. evaluate_consistency_over_dataset(model, tokenizer, explainer, texts)")
-    print("3. Il risultato misura la stabilità dell'explainer")
-    print("4. Valori attesi: 0.5-0.9 (più alto = più stabile)")
-    print("5. Se consistency > 0.99, il dropout potrebbe essere troppo basso")
+    finally:
+        models.clear_gpu_memory()

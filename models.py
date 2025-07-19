@@ -1,10 +1,14 @@
 """
-models.py – Gestione modelli pre-trained per sentiment analysis (GPU ENABLED)
+models.py – Gestione modelli pre-trained per sentiment analysis (GOOGLE COLAB)
 ============================================================
 
-AGGIORNAMENTO: Forza uso GPU quando disponibile
+Versione ottimizzata per Google Colab con GPU.
+Assume sempre ambiente Colab con GPU disponibile.
 """
 
+import os
+import gc
+import warnings
 from typing import Dict
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -19,22 +23,46 @@ MODELS: Dict[str, str] = {
 }
 
 # ==== GPU Configuration ====
-def get_device():
-    """Restituisce il device ottimale (GPU se disponibile, altrimenti CPU)."""
+def setup_colab_gpu():
+    """Setup GPU per Colab."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"[GPU] Using: {torch.cuda.get_device_name()}")
         print(f"[GPU] Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        
+        # Ottimizzazioni Colab
+        torch.cuda.set_per_process_memory_fraction(0.9)  # Usa 90% GPU memory
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
         return device
     else:
-        print("[CPU] CUDA not available, using CPU")
+        print("[WARNING] GPU not available, using CPU")
         return torch.device("cpu")
 
 # Device globale
-DEVICE = get_device()
+DEVICE = setup_colab_gpu()
 
+# ==== Memory Management ====
+def get_gpu_memory_usage():
+    """Restituisce uso memoria GPU in GB."""
+    if torch.cuda.is_available():
+        return {
+            "allocated": torch.cuda.memory_allocated() / 1024**3,
+            "reserved": torch.cuda.memory_reserved() / 1024**3,
+            "max_allocated": torch.cuda.max_memory_allocated() / 1024**3
+        }
+    return {"allocated": 0, "reserved": 0, "max_allocated": 0}
+
+def clear_gpu_memory():
+    """Pulisce memoria GPU."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+# ==== Tokenizer Loading ====
 def load_tokenizer(model_key: str):
-    """Restituisce il tokenizer associato al modello."""
+    """Carica tokenizer."""
     if model_key not in MODELS:
         raise ValueError(f"Modello '{model_key}' non trovato. Disponibili: {list(MODELS.keys())}")
     
@@ -43,7 +71,7 @@ def load_tokenizer(model_key: str):
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        # FIX: Assicura che ci sia un pad_token
+        # Fix pad_token se mancante
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token or "[PAD]"
             
@@ -52,60 +80,62 @@ def load_tokenizer(model_key: str):
         print(f"Errore caricamento tokenizer {model_key}: {e}")
         raise
 
+# ==== Model Loading ====
 def load_model(model_key: str, num_labels: int = 2):
-    """Carica il modello pre-addestrato per sentiment analysis SU GPU."""
+    """Carica modello su GPU con gestione OOM."""
     if model_key not in MODELS:
         raise ValueError(f"Modello '{model_key}' non trovato. Disponibili: {list(MODELS.keys())}")
     
     model_name = MODELS[model_key]
     
     try:
+        # Cleanup preventivo
+        clear_gpu_memory()
+        
         # Carica modello
         try:
             model = AutoModelForSequenceClassification.from_pretrained(
                 model_name,
                 num_labels=num_labels,
                 ignore_mismatched_sizes=True,
-                attn_implementation="eager",
-                torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32  # FP16 su GPU per efficienza
+                torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+                attn_implementation="eager",  # Più stabile per Colab
+                low_cpu_mem_usage=True,
             )
-            print(f"[DEBUG] {model_key}: caricato con attn_implementation='eager'")
-        except (ValueError, TypeError) as e:
-            print(f"[DEBUG] {model_key}: fallback loading (attn_implementation non supportato)")
+        except (ValueError, TypeError):
+            # Fallback senza attn_implementation
             model = AutoModelForSequenceClassification.from_pretrained(
                 model_name,
                 num_labels=num_labels,
                 ignore_mismatched_sizes=True,
-                torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32
+                torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+                low_cpu_mem_usage=True,
             )
         
-        # FORZA modello su GPU
+        # Sposta su GPU
         model = model.to(DEVICE)
         model.eval()
         
-        # Verifica che sia effettivamente su GPU
+        # Log memoria
         if DEVICE.type == "cuda":
-            print(f"[GPU] Model {model_key} loaded on {next(model.parameters()).device}")
-            # Mostra uso memoria GPU
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            print(f"[GPU] Memory allocated: {allocated:.2f}GB")
-        
-        # Verifica configurazione
-        if hasattr(model.config, 'num_labels'):
-            actual_labels = model.config.num_labels
-            if actual_labels != num_labels:
-                print(f"[INFO] {model_key}: ha {actual_labels} labels, richieste {num_labels}. "
-                      f"Utilizzando configurazione del modello.")
+            gpu_mem = get_gpu_memory_usage()
+            print(f"[GPU] Model loaded: {gpu_mem['allocated']:.2f}GB allocated")
         
         return model
         
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"[OOM] GPU out of memory per {model_key}. Prova un modello più piccolo.")
+            clear_gpu_memory()
+            raise RuntimeError(f"OOM loading {model_key}. Try smaller model like 'tinybert' or 'distilbert'")
+        raise
     except Exception as e:
         print(f"Errore caricamento modello {model_key}: {e}")
         raise
 
-
+# ==== Batch Processing ====
 def move_batch_to_device(batch):
-    """Sposta un batch di dati sul device corretto."""
+    """Sposta batch su GPU."""
     if isinstance(batch, dict):
         return {k: v.to(DEVICE) if hasattr(v, 'to') else v for k, v in batch.items()}
     elif hasattr(batch, 'to'):
@@ -113,77 +143,54 @@ def move_batch_to_device(batch):
     else:
         return batch
 
-def get_gpu_memory_usage():
-    """Restituisce uso memoria GPU in GB."""
+# ==== Utilities ====
+def print_gpu_status():
+    """Stampa status GPU."""
     if torch.cuda.is_available():
-        return {
-            "allocated": torch.cuda.memory_allocated() / 1024**3,
-            "cached": torch.cuda.memory_reserved() / 1024**3,
-            "max_allocated": torch.cuda.max_memory_allocated() / 1024**3
-        }
-    return {"allocated": 0, "cached": 0, "max_allocated": 0}
+        mem = get_gpu_memory_usage()
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"Memory: {mem['allocated']:.2f}GB / {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+    else:
+        print("GPU: Not available")
 
-# ==== Test di compatibilità ====
+# ==== Test ====
 if __name__ == "__main__":
-    """Test veloce per verificare che tutti i modelli si carichino correttamente su GPU."""
-    print("Testing model loading with GPU...")
-    print("=" * 50)
+    """Test veloce per Colab."""
+    print("Testing models on Colab...")
+    print_gpu_status()
     
-    # Info GPU iniziale
-    print(f"Device: {DEVICE}")
-    gpu_info = get_gpu_memory_usage()
-    print(f"GPU Memory initial: {gpu_info['allocated']:.2f}GB allocated")
-    
-    for model_key in list(MODELS.keys())[:2]:  # Testa solo i primi 2 per velocità
+    # Test modelli piccoli
+    for model_key in ["tinybert", "distilbert"]:
         try:
             print(f"\nTesting {model_key}...")
-            print(f"  Model name: {MODELS[model_key]}")
             
-            # Test tokenizer
-            print("  Loading tokenizer...", end="")
+            # Tokenizer
             tokenizer = load_tokenizer(model_key)
-            print(" ✓")
+            print(f"  Tokenizer: ✓")
             
-            # Test model
-            print("  Loading model...", end="")
+            # Model
             model = load_model(model_key)
-            print(" ✓")
+            print(f"  Model: ✓")
             
-            # Verifica device
-            model_device = next(model.parameters()).device
-            print(f"  Model device: {model_device}")
-            
-            # Test inference con GPU
-            print("  Testing GPU inference...", end="")
-            test_text = "This is a test sentence."
+            # Inference test
+            test_text = "This is a test."
             encoded = tokenizer(test_text, return_tensors="pt", max_length=50, truncation=True)
-            
-            # IMPORTANTE: Sposta input su GPU
             encoded = move_batch_to_device(encoded)
             
             with torch.no_grad():
                 outputs = model(**encoded)
-                logits = outputs.logits
             
-            print(f" ✓ (logits shape: {logits.shape}, device: {logits.device})")
+            print(f"  Inference: ✓ (shape: {outputs.logits.shape})")
+            print(f"  SUCCESS: {model_key}")
             
-            # Mostra memoria GPU
-            gpu_info = get_gpu_memory_usage()
-            print(f"  GPU Memory: {gpu_info['allocated']:.2f}GB allocated")
-            
-            print(f"  SUCCESS: {model_key} on {model_device}")
-            
-            # Cleanup per test successivo
+            # Cleanup
             del model
-            torch.cuda.empty_cache()
+            clear_gpu_memory()
             
         except Exception as e:
-            print(f"  FAILED: {model_key}")
-            print(f"    Error: {str(e)}")
+            print(f"  FAILED: {model_key} - {e}")
     
-    print("\n" + "=" * 50)
-    print("Model loading test completed!")
+    print("\nTest completed!")
+    print_gpu_status()
+
     
-    # Memory finale
-    gpu_final = get_gpu_memory_usage()
-    print(f"Final GPU Memory: {gpu_final['allocated']:.2f}GB allocated")
