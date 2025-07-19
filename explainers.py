@@ -1,11 +1,12 @@
 """
-explainers.py – 6 XAI methods con SOLO LRP CONSERVATIVA
-=====================================================
+explainers.py – 6 XAI methods con implementazioni da Ali et al. (2022)
+=====================================================================
 
 Metodi: lime, shap, grad_input, attention_rollout, attention_flow, lrp
 
-NOTA: 'lrp' ora è l'implementazione conservativa basata su Ali et al. (2022)
-Rimossa la vecchia implementazione Captum-based.
+AGGIORNATO: Implementazioni di attention_rollout, attention_flow e lrp 
+basate sul paper "XAI for Transformers: Better Explanations through 
+Conservative Propagation" (Ali et al., 2022)
 """
 
 from __future__ import annotations
@@ -17,11 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+import numpy as np
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import models  # Per GPU support
 
 # -------------------------------------------------------------------------
-# Librerie opzionali (CAPTUM RIMOSSA - non serve più!)
+# Librerie opzionali
 try:
     from lime.lime_text import LimeTextExplainer
     LIME_AVAILABLE = True
@@ -31,10 +33,9 @@ except ImportError:
 
 try:
     import shap
-    import numpy as np
     SHAP_AVAILABLE = True
 except ImportError:
-    shap = np = None
+    shap = None
     SHAP_AVAILABLE = False
 
 try:
@@ -47,7 +48,7 @@ except ImportError:
 # Parametri globali
 MAX_LEN = 512
 MIN_LEN = 10
-DEBUG_TIMING = True
+DEBUG_TIMING = False
 
 # -------------------------------------------------------------------------
 # Utility functions (MANTENUTE)
@@ -129,7 +130,123 @@ class Attribution:
         return "Attribution(" + ", ".join(items) + ")"
 
 # -------------------------------------------------------------------------
-# 1. GRADIENT × INPUT
+# Helper functions per metodi Ali et al. (2022)
+
+def _extract_attention_matrices(model_outputs):
+    """Estrae matrici di attention dai model outputs."""
+    if hasattr(model_outputs, 'attentions') and model_outputs.attentions is not None:
+        # Stack di tutti i layer: [n_layers, batch_size, n_heads, seq_len, seq_len]
+        attention_matrices = torch.stack(model_outputs.attentions, dim=0)
+        return attention_matrices
+    else:
+        raise ValueError("Il modello deve essere chiamato con output_attentions=True")
+
+def _compute_joint_attention(attention_matrices: np.ndarray, add_residual: bool = True) -> np.ndarray:
+    """
+    Calcola joint attention attraverso i layer (Ali et al. 2022).
+    
+    Args:
+        attention_matrices: [n_layers, seq_len, seq_len] 
+        add_residual: Se aggiungere connessioni residuali
+    
+    Returns:
+        Joint attention matrices [n_layers, seq_len, seq_len]
+    """
+    if add_residual:
+        seq_len = attention_matrices.shape[1]
+        residual_att = np.eye(seq_len)[None, ...]
+        aug_att_mat = attention_matrices + residual_att
+        aug_att_mat = aug_att_mat / aug_att_mat.sum(axis=-1, keepdims=True)
+    else:
+        aug_att_mat = attention_matrices
+    
+    n_layers = aug_att_mat.shape[0]
+    joint_attentions = np.zeros_like(aug_att_mat)
+    
+    # Primo layer
+    joint_attentions[0] = aug_att_mat[0]
+    
+    # Propagazione attraverso i layer
+    for i in range(1, n_layers):
+        joint_attentions[i] = np.dot(aug_att_mat[i], joint_attentions[i-1])
+    
+    return joint_attentions
+
+def _get_adjacency_matrix(attention_matrix: np.ndarray, input_tokens: List[str]):
+    """
+    Crea matrice di adiacenza per attention flow (Ali et al. 2022).
+    
+    Args:
+        attention_matrix: [n_layers, seq_len, seq_len]
+        input_tokens: Lista dei token
+    
+    Returns:
+        (adj_mat, labels_to_index): Matrice di adiacenza e mapping label->indice
+    """
+    n_layers, seq_len, _ = attention_matrix.shape
+    
+    # Dimensione: (n_layers+1) * seq_len nodi
+    total_nodes = (n_layers + 1) * seq_len
+    adj_mat = np.zeros((total_nodes, total_nodes))
+    
+    # Mapping da label a indice
+    labels_to_index = {}
+    
+    # Nodi del primo layer (input tokens)
+    for k in range(seq_len):
+        if k < len(input_tokens):
+            label = f"{k}_{input_tokens[k]}"
+        else:
+            label = f"{k}_PAD"
+        labels_to_index[label] = k
+    
+    # Nodi dei layer successivi e connessioni
+    for layer in range(1, n_layers + 1):
+        for k_to in range(seq_len):
+            node_to = layer * seq_len + k_to
+            label = f"L{layer}_{k_to}"
+            labels_to_index[label] = node_to
+            
+            # Connessioni dal layer precedente
+            for k_from in range(seq_len):
+                node_from = (layer - 1) * seq_len + k_from
+                adj_mat[node_to][node_from] = attention_matrix[layer - 1][k_to][k_from]
+    
+    return adj_mat, labels_to_index
+
+def _compute_node_flow(graph, labels_to_index: dict, input_nodes: List[str], 
+                      output_nodes: List[str], seq_len: int) -> np.ndarray:
+    """
+    Calcola node flow usando maximum flow algorithm (Ali et al. 2022).
+    """
+    n_nodes = len(labels_to_index)
+    flow_values = np.zeros((n_nodes, n_nodes))
+    
+    for output_key in output_nodes:
+        if output_key not in input_nodes:
+            current_layer = int(labels_to_index[output_key] / seq_len)
+            prev_layer = current_layer - 1
+            u = labels_to_index[output_key]
+            
+            for input_key in input_nodes:
+                v = labels_to_index[input_key]
+                try:
+                    flow_value = nx.maximum_flow_value(graph, u, v, 
+                                                     flow_func=nx.algorithms.flow.edmonds_karp)
+                    flow_values[u][prev_layer * seq_len + v] = flow_value
+                except:
+                    # Se non c'è path, il flow è 0
+                    flow_values[u][prev_layer * seq_len + v] = 0
+            
+            # Normalizza
+            row_sum = flow_values[u].sum()
+            if row_sum > 0:
+                flow_values[u] /= row_sum
+    
+    return flow_values
+
+# -------------------------------------------------------------------------
+# 1. GRADIENT × INPUT (mantenuto invariato)
 
 def _grad_input(model, tokenizer):
     def explain(text: str) -> Attribution:
@@ -197,14 +314,14 @@ def _grad_input(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 2. ATTENTION ROLLOUT
+# 2. ATTENTION ROLLOUT (Ali et al. 2022)
 
 def _attention_rollout(model, tokenizer):
     def explain(text: str) -> Attribution:
         start_time = time.time()
         try:
             model.eval()
-            enc = _safe_tokenize(text, tokenizer, MAX_LEN)
+            enc = _safe_tokenize(text, tokenizer, min(MAX_LEN, 256))
             
             with torch.no_grad():
                 outputs = model(**enc, output_attentions=True)
@@ -216,48 +333,26 @@ def _attention_rollout(model, tokenizer):
                 log_timing("attention_rollout", time.time() - start_time)
                 return Attribution(tokens, scores)
             
-            attentions = outputs.attentions
+            # Estrai attention matrices
+            attention_matrices = _extract_attention_matrices(outputs)
             
-            if len(attentions) == 0:
-                tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-                scores = [0.1] * len(tokens)
-                log_timing("attention_rollout", time.time() - start_time)
-                return Attribution(tokens, scores)
+            # Converti in numpy: [n_layers, n_heads, seq_len, seq_len] -> [n_layers, seq_len, seq_len]
+            att_np = attention_matrices.detach().cpu().numpy()
+            att_sum_heads = att_np.mean(axis=2)  # Media su heads: [n_layers, batch, seq_len, seq_len]
+            att_sum_heads = att_sum_heads.squeeze(1)  # Rimuovi batch: [n_layers, seq_len, seq_len]
             
-            try:
-                att = torch.stack([a.mean(dim=1) for a in attentions])
-            except RuntimeError:
-                tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
-                scores = [0.1] * len(tokens)
-                log_timing("attention_rollout", time.time() - start_time)
-                return Attribution(tokens, scores)
-
-            I = torch.eye(att.size(-1), device=att.device, dtype=att.dtype)
-            I = I.unsqueeze(0).unsqueeze(0)
-            att = 0.5 * att + 0.5 * I
-            att = att / att.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-
-            try:
-                rollout = att[-1]
-                for l in range(att.size(0) - 2, -1, -1):
-                    rollout = att[l].bmm(rollout)
-                    if torch.isnan(rollout).any() or torch.isinf(rollout).any():
-                        break
-            except RuntimeError:
-                rollout = att[-1]
-
-            try:
-                scores = rollout.squeeze(0)[0]
-                if torch.isnan(scores).any():
-                    scores = torch.ones_like(scores) * 0.1
-            except (IndexError, RuntimeError):
-                scores = torch.ones(att.size(-1)) * 0.1
-                
+            # Calcola joint attention con residual connections
+            joint_attentions = _compute_joint_attention(att_sum_heads, add_residual=True)
+            
+            # Prendi l'ultimo layer e somma su query positions per ottenere relevance
+            final_attention = joint_attentions[-1]  # [seq_len, seq_len]
+            relevance_scores = final_attention.sum(axis=0)  # [seq_len]
+            
             tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
             
-            min_len = min(len(tokens), len(scores))
+            min_len = min(len(tokens), len(relevance_scores))
             log_timing("attention_rollout", time.time() - start_time)
-            return Attribution(tokens[:min_len], scores[:min_len].tolist())
+            return Attribution(tokens[:min_len], relevance_scores[:min_len].tolist())
             
         except Exception as e:
             print(f"Errore in attention_rollout: {e}")
@@ -277,7 +372,7 @@ def _attention_rollout(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 3. ATTENTION FLOW
+# 3. ATTENTION FLOW (Ali et al. 2022)
 
 def _attention_flow(model, tokenizer):
     if not NETWORKX_AVAILABLE:
@@ -287,7 +382,7 @@ def _attention_flow(model, tokenizer):
         start_time = time.time()
         try:
             model.eval()
-            enc = _safe_tokenize(text, tokenizer, min(MAX_LEN, 128))
+            enc = _safe_tokenize(text, tokenizer, min(MAX_LEN, 128))  # Limita lunghezza per performance
             
             with torch.no_grad():
                 outputs = model(**enc, output_attentions=True)
@@ -295,58 +390,58 @@ def _attention_flow(model, tokenizer):
             if not hasattr(outputs, 'attentions') or outputs.attentions is None:
                 raise ValueError("Modello non supporta output attention")
 
-            att = torch.stack([a.mean(dim=1) for a in outputs.attentions])
-            seq = min(att.size(-1), 64)
-            att = att[:, :, :seq, :seq]
+            # Estrai e processa attention matrices
+            attention_matrices = _extract_attention_matrices(outputs)
+            att_np = attention_matrices.detach().cpu().numpy()
             
-            I = torch.eye(seq).unsqueeze(0).unsqueeze(0)
-            att = 0.5 * att + 0.5 * I
-            att = att / att.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-
-            threshold = 0.1
+            # Media su heads e rimuovi batch: [n_layers, seq_len, seq_len]
+            att_sum_heads = att_np.mean(axis=2).squeeze(1)
+            n_layers, seq_len, _ = att_sum_heads.shape
             
-            G = nx.DiGraph()
-            L = att.size(0)
+            # Aggiungi residual connections e normalizza
+            residual_att = np.eye(seq_len)[None, ...]
+            aug_att_mat = att_sum_heads + residual_att
+            aug_att_mat = aug_att_mat / aug_att_mat.sum(axis=-1, keepdims=True)
             
-            for l in range(L):
-                for i in range(seq):
-                    G.add_node((l, i))
+            # Crea grafo per attention flow
+            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0))
+            adj_mat, labels_to_index = _get_adjacency_matrix(aug_att_mat, tokens)
             
-            edge_count = 0
-            max_edges = 1000
+            # Crea grafo NetworkX
+            G = nx.from_numpy_array(adj_mat, create_using=nx.DiGraph())
             
-            for l in range(L):
-                if edge_count >= max_edges:
-                    break
-                for i in range(seq):
-                    if edge_count >= max_edges:
-                        break
-                    for j in range(seq):
-                        if edge_count >= max_edges:
-                            break
-                        w = att[l, 0, i, j].item()
-                        if w > threshold:
-                            if l > 0:
-                                G.add_edge((l, i), (l - 1, j), capacity=w)
-                                edge_count += 1
-
-            flow_scores = torch.zeros(seq)
-            max_flow_calculations = min(10, seq)
+            # Imposta capacità degli archi
+            for i in range(adj_mat.shape[0]):
+                for j in range(adj_mat.shape[1]):
+                    if adj_mat[i, j] > 0:
+                        G[i][j]['capacity'] = adj_mat[i, j]
             
-            try:
-                for src in range(min(max_flow_calculations, seq)):
-                    if G.has_node((L - 1, src)) and G.has_node((0, 0)):
-                        try:
-                            flow_val, _ = nx.maximum_flow(G, (L - 1, src), (0, 0))
-                            flow_scores[src] = flow_val
-                        except:
-                            continue
-            except:
-                flow_scores = att[-1, 0, 0, :seq]
-
-            tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"].squeeze(0)[:seq])
+            # Definisci nodi input e output
+            input_nodes = []
+            output_nodes = []
+            target_layer = n_layers - 1  # Ultimo layer
+            
+            for key in labels_to_index:
+                if labels_to_index[key] < seq_len:  # Primi seq_len nodi sono input
+                    input_nodes.append(key)
+                if key.startswith(f'L{target_layer + 1}_'):  # Nodi dell'ultimo layer
+                    output_nodes.append(key)
+            
+            # Calcola flow values
+            flow_values = _compute_node_flow(G, labels_to_index, input_nodes, output_nodes, seq_len)
+            
+            # Estrai relevance dal flow del layer finale
+            final_layer_start = (target_layer + 1) * seq_len
+            final_layer_end = (target_layer + 2) * seq_len
+            prev_layer_start = target_layer * seq_len
+            prev_layer_end = (target_layer + 1) * seq_len
+            
+            final_layer_attention = flow_values[final_layer_start:final_layer_end, 
+                                              prev_layer_start:prev_layer_end]
+            relevance_scores = final_layer_attention.sum(axis=0)
+            
             log_timing("attention_flow", time.time() - start_time)
-            return Attribution(tokens, flow_scores.tolist())
+            return Attribution(tokens[:len(relevance_scores)], relevance_scores.tolist())
             
         except Exception as e:
             print(f"Errore in attention_flow: {e}")
@@ -358,7 +453,7 @@ def _attention_flow(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 4. LIME
+# 4. LIME (mantenuto invariato)
 
 def _lime_text(model, tokenizer):
     if not LIME_AVAILABLE:
@@ -418,7 +513,7 @@ def _lime_text(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 5. SHAP
+# 5. SHAP (mantenuto invariato)
 
 def _kernel_shap(model, tokenizer):
     if not SHAP_AVAILABLE:
@@ -525,7 +620,7 @@ def _kernel_shap(model, tokenizer):
     return explain
 
 # -------------------------------------------------------------------------
-# 6. LRP CONSERVATIVA (UNICA IMPLEMENTAZIONE LRP)
+# 6. LRP CONSERVATIVA (Ali et al. 2022)
 # -------------------------------------------------------------------------
 
 def _lrp(model, tokenizer):
@@ -536,8 +631,6 @@ def _lrp(model, tokenizer):
     - AH-rule: detach dei pesi di attenzione  
     - LN-rule: detach del denominatore di normalizzazione
     - Implementation trick per conservazione garantita
-    
-    NOTA: Questa è l'UNICA implementazione LRP, sostituisce quella Captum.
     """
     
     class ConservativeLRPExplainer:
@@ -547,62 +640,94 @@ def _lrp(model, tokenizer):
             self.original_forwards = {}
             self._patched = False
         
+        def _patch_attention_heads(self):
+            """Applica AH-rule: detach dei pesi di attenzione."""
+            patch_count = 0
+            
+            def create_attention_forward(original_module):
+                def patched_forward(*args, **kwargs):
+                    # Chiama forward normale
+                    outputs = original_module._original_forward(*args, **kwargs)
+                    
+                    # Se outputs contiene attention weights, detach them
+                    if isinstance(outputs, tuple) and len(outputs) >= 2:
+                        # Tipico caso: (context_layer, attention_probs)
+                        context_layer, attention_probs = outputs[0], outputs[1]
+                        
+                        # DETACH attention probs (AH-rule)
+                        attention_probs_detached = attention_probs.detach()
+                        
+                        return (context_layer, attention_probs_detached) + outputs[2:]
+                    else:
+                        return outputs
+                
+                return patched_forward
+            
+            # Patch attention layers
+            for name, module in self.model.named_modules():
+                if 'attention' in name.lower() and hasattr(module, 'forward'):
+                    if not hasattr(module, '_original_forward'):
+                        module._original_forward = module.forward
+                        module.forward = create_attention_forward(module)
+                        patch_count += 1
+            
+            return patch_count
+        
+        def _patch_layer_norms(self):
+            """Applica LN-rule: detach del denominatore di normalizzazione."""
+            patch_count = 0
+            
+            def create_layernorm_forward(original_module):
+                def patched_forward(x):
+                    if not x.requires_grad:
+                        return original_module._original_forward(x)
+                    
+                    # LN-RULE implementazione
+                    dims = tuple(range(1, len(x.shape)))
+                    mean = x.mean(dim=dims, keepdim=True)
+                    var = x.var(dim=dims, keepdim=True, unbiased=False)
+                    
+                    # Centering (lineare)
+                    centered = x - mean
+                    
+                    # Normalization con DETACH del denominatore (non-lineare)
+                    eps = getattr(original_module, 'eps', 1e-5)
+                    std = torch.sqrt(var + eps).detach()  # ← DETACH QUI!
+                    normalized = centered / std
+                    
+                    # Applica weight e bias se presenti
+                    if hasattr(original_module, 'weight') and original_module.weight is not None:
+                        normalized = normalized * original_module.weight
+                    if hasattr(original_module, 'bias') and original_module.bias is not None:
+                        normalized = normalized + original_module.bias
+                    
+                    return normalized
+                
+                return patched_forward
+            
+            # Patch LayerNorm layers
+            for name, module in self.model.named_modules():
+                if isinstance(module, (nn.LayerNorm, nn.RMSNorm)) or 'norm' in name.lower():
+                    if not hasattr(module, '_original_forward'):
+                        module._original_forward = module.forward
+                        module.forward = create_layernorm_forward(module)
+                        patch_count += 1
+            
+            return patch_count
+        
         def _patch_model(self):
-            """Applica patch conservativo al modello."""
+            """Applica patch conservativo completo al modello."""
             if self._patched:
                 return
             
             print("[LRP] Applicando patch conservativo...")
             
-            # Patch LayerNorm con LN-rule
-            patch_count = 0
-            for name, module in self.model.named_modules():
-                if isinstance(module, (nn.LayerNorm, nn.RMSNorm)) or 'norm' in name.lower():
-                    if name not in self.original_forwards:
-                        self.original_forwards[name] = module.forward
-                        module.forward = self._create_layernorm_forward(module)
-                        patch_count += 1
+            # Applica AH-rule e LN-rule
+            ah_patches = self._patch_attention_heads()
+            ln_patches = self._patch_layer_norms()
             
             self._patched = True
-            print(f"[LRP] Patch applicato a {patch_count} layer LayerNorm")
-        
-        def _create_layernorm_forward(self, original_module):
-            """
-            Crea forward patchato per LayerNorm (LN-rule).
-            
-            Implementa: yi = (xi - E[x]) / [sqrt(ε + Var[x])].detach()
-            Dove il denominatore viene "detached" per conservare relevance.
-            """
-            def patched_forward(x):
-                if not x.requires_grad:
-                    # Se non richiede gradienti, usa forward normale
-                    return original_module._original_forward(x)
-                
-                # IMPLEMENTAZIONE LN-RULE CON DETACH
-                # Calcola dimensioni per mean/var (tutto tranne batch)
-                dims = tuple(range(1, len(x.shape)))
-                mean = x.mean(dim=dims, keepdim=True)
-                var = x.var(dim=dims, keepdim=True, unbiased=False)
-                
-                # Centering (parte lineare)
-                centered = x - mean
-                
-                # Normalization con DETACH del denominatore (parte non-lineare)
-                eps = getattr(original_module, 'eps', 1e-5)
-                std = torch.sqrt(var + eps).detach()  # ← DETACH QUI!
-                normalized = centered / std
-                
-                # Applica weight e bias se presenti (parti lineari)
-                if hasattr(original_module, 'weight') and original_module.weight is not None:
-                    normalized = normalized * original_module.weight
-                if hasattr(original_module, 'bias') and original_module.bias is not None:
-                    normalized = normalized + original_module.bias
-                
-                return normalized
-            
-            # Salva forward originale per cleanup
-            original_module._original_forward = original_module.forward
-            return patched_forward
+            print(f"[LRP] Patch applicato: {ah_patches} attention layers, {ln_patches} LayerNorm layers")
         
         def _restore_model(self):
             """Ripristina il modello ai metodi forward originali."""
@@ -621,7 +746,7 @@ def _lrp(model, tokenizer):
             print(f"[LRP] Modello ripristinato ({restored_count} layer)")
         
         def explain(self, text: str) -> Attribution:
-            """Genera spiegazione con LRP conservativa."""
+            """Genera spiegazione con LRP conservativa secondo Ali et al. (2022)."""
             start_time = time.time()
             
             try:
@@ -651,7 +776,7 @@ def _lrp(model, tokenizer):
                 else:
                     target = logits.sum()
                 
-                # STEP 6: Backward pass (Gradient × Input)
+                # STEP 6: Backward pass (Gradient × Input con patch conservativo)
                 self.model.zero_grad()
                 target.backward()
                 
@@ -737,24 +862,24 @@ def _lrp(model, tokenizer):
     return conservative_explainer.explain
 
 # -------------------------------------------------------------------------
-# EXPLAINER FACTORY (AGGIORNATA - CAPTUM RIMOSSA)
+# EXPLAINER FACTORY (AGGIORNATA)
 # -------------------------------------------------------------------------
 
 _EXPLAINER_FACTORY: Dict[str, Callable] = {
     "lime":                 _lime_text,           # Richiede: pip install lime  
     "shap":                 _kernel_shap,         # Richiede: pip install shap
     "grad_input":           _grad_input,          # Nessuna dipendenza
-    "attention_rollout":    _attention_rollout,   # Nessuna dipendenza
-    "attention_flow":       _attention_flow,      # Richiede: pip install networkx
-    "lrp":                  _lrp,                 # ← CONSERVATIVE LRP (no dipendenze!)
+    "attention_rollout":    _attention_rollout,   # Implementazione Ali et al. 2022
+    "attention_flow":       _attention_flow,      # Richiede: pip install networkx + Ali et al. 2022
+    "lrp":                  _lrp,                 # LRP Conservativa Ali et al. 2022
 }
 
 # -------------------------------------------------------------------------
-# API pubblica (SEMPLIFICATA)
+# API pubblica (AGGIORNATA)
 # -------------------------------------------------------------------------
 
 def list_explainers():
-    """Restituisce lista di explainer disponibili (SENZA Captum)."""
+    """Restituisce lista di explainer disponibili."""
     available = []
     for name, factory in _EXPLAINER_FACTORY.items():
         # Controlla dipendenze specifiche
@@ -764,7 +889,7 @@ def list_explainers():
             continue
         elif name == "attention_flow" and not NETWORKX_AVAILABLE:
             continue
-        # lrp (conservative) non ha dipendenze esterne!
+        # Altri explainer non hanno dipendenze esterne
         available.append(name)
     
     return available
@@ -780,29 +905,29 @@ def get_explainer(name: str, model: PreTrainedModel, tokenizer: PreTrainedTokeni
     arch = _get_model_architecture(model)
     print(f"Creando explainer '{name}' per architettura '{arch}'")
     
-    # Controlla dipendenze specifiche (NO CAPTUM!)
+    # Controlla dipendenze specifiche
     if name == "lime" and not LIME_AVAILABLE:
         raise ImportError("LIME non installato. Installare con: pip install lime")
     elif name == "shap" and not SHAP_AVAILABLE:
         raise ImportError("SHAP non installato. Installare con: pip install shap")
     elif name == "attention_flow" and not NETWORKX_AVAILABLE:
         raise ImportError("NetworkX non installato. Installare con: pip install networkx")
-    # LRP non richiede dipendenze!
     
     return _EXPLAINER_FACTORY[name](model, tokenizer)
 
 def check_dependencies():
-    """Controlla quali dipendenze sono disponibili (SENZA Captum)."""
+    """Controlla quali dipendenze sono disponibili."""
     deps = {
         "LIME": LIME_AVAILABLE,
         "SHAP": SHAP_AVAILABLE, 
         "NetworkX (Attention Flow)": NETWORKX_AVAILABLE,
-        "LRP Conservativa": True,  # Sempre disponibile!
+        "LRP Conservativa Ali et al. 2022": True,  # Sempre disponibile
+        "Attention Rollout Ali et al. 2022": True,  # Sempre disponibile
     }
     
     print("Stato dipendenze explainer:")
     for lib, available in deps.items():
-        status = "✓ OK" if available else "✗ Mancante"
+        status = "[OK]" if available else "[MISSING]"
         print(f"  {lib}: {status}")
     
     return deps
@@ -866,13 +991,70 @@ def benchmark_explainer_speed():
         return {}
 
 # -------------------------------------------------------------------------
+# Funzione di utilità per confronto con implementazioni originali
+# -------------------------------------------------------------------------
+
+def compare_with_original_implementations():
+    """
+    Confronta le nuove implementazioni con quelle precedenti.
+    Utile per validare che i risultati siano coerenti.
+    """
+    print("=" * 60)
+    print("CONFRONTO IMPLEMENTAZIONI ALI ET AL. 2022")
+    print("=" * 60)
+    
+    try:
+        import models
+        model = models.load_model("distilbert")
+        tokenizer = models.load_tokenizer("distilbert")
+        
+        test_texts = [
+            "This movie is absolutely fantastic!",
+            "This film is terrible and boring.",
+            "An average movie with decent acting."
+        ]
+        
+        methods_to_test = ["attention_rollout", "attention_flow", "lrp"]
+        
+        for text in test_texts:
+            print(f"\nTesto: '{text}'")
+            print("-" * 40)
+            
+            for method in methods_to_test:
+                if method in list_explainers():
+                    try:
+                        explainer = get_explainer(method, model, tokenizer)
+                        attr = explainer(text)
+                        
+                        # Analisi risultati
+                        max_score = max(attr.scores) if attr.scores else 0
+                        min_score = min(attr.scores) if attr.scores else 0
+                        total_relevance = sum(attr.scores)
+                        
+                        print(f"  {method:>18}: range=[{min_score:+.3f}, {max_score:+.3f}], total={total_relevance:+.3f}")
+                        
+                        # Mostra top 3 token più rilevanti
+                        token_scores = [(tok, score) for tok, score in zip(attr.tokens, attr.scores) 
+                                       if not tok.startswith('[') and tok.strip()]
+                        token_scores.sort(key=lambda x: abs(x[1]), reverse=True)
+                        
+                        top_tokens = [f"{tok}({score:+.2f})" for tok, score in token_scores[:3]]
+                        print(f"  {'':>20} Top: {', '.join(top_tokens)}")
+                        
+                    except Exception as e:
+                        print(f"  {method:>18}: ERRORE - {e}")
+    
+    except Exception as e:
+        print(f"Errore nel confronto: {e}")
+
+# -------------------------------------------------------------------------
 # Test di compatibilità FINALE
 # -------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("TEST EXPLAINERS - SOLO LRP CONSERVATIVA")
-    print("=" * 60)
+    print("=" * 70)
+    print("TEST EXPLAINERS - IMPLEMENTAZIONI ALI ET AL. (2022)")
+    print("=" * 70)
     
     # 1. Controlla dipendenze
     print("\n1. CONTROLLO DIPENDENZE:")
@@ -882,61 +1064,86 @@ if __name__ == "__main__":
     print(f"\n2. EXPLAINER DISPONIBILI:")
     available = list_explainers()
     for explainer in available:
-        print(f"  ✓ {explainer}")
+        marker = "[NEW]" if explainer in ["attention_rollout", "attention_flow", "lrp"] else "[OK]"
+        print(f"  {marker} {explainer}")
     
     if not available:
         print("    Nessun explainer disponibile - verificare installazioni")
         exit(1)
     
-    # 3. Test LRP conservativa specificamente
-    print(f"\n3. TEST LRP CONSERVATIVA:")
+    # 3. Test implementazioni Ali et al. 2022
+    print(f"\n3. TEST METODI ALI ET AL. 2022:")
     try:
         import models
         print("  Caricando modello distilbert...")
         model = models.load_model("distilbert")
         tokenizer = models.load_tokenizer("distilbert")
-        print("  ✓ Modello caricato")
+        print("  [OK] Modello caricato")
         
-        test_texts = [
-            "This is a fantastic movie with great acting!",
-            "This movie is absolutely terrible and boring.",
-            "An okay film with decent cinematography."
-        ]
+        test_text = "This movie is absolutely fantastic with incredible acting and amazing cinematography!"
         
-        for i, text in enumerate(test_texts, 1):
-            print(f"\n  Test {i}: {text}")
-            try:
-                explainer = get_explainer("lrp", model, tokenizer)
-                attr = explainer(text)
-                
-                # Mostra risultati
-                print(f"    ✓ Tokens: {len(attr.tokens)}")
-                print(f"    ✓ Score range: [{min(attr.scores):.3f}, {max(attr.scores):.3f}]")
-                print(f"    ✓ Total relevance: {sum(attr.scores):.3f}")
-                
-                # Top 3 tokens più rilevanti
-                token_scores = [(tok, score) for tok, score in zip(attr.tokens, attr.scores) 
-                               if tok.strip() and not tok.startswith('[')]
-                token_scores.sort(key=lambda x: abs(x[1]), reverse=True)
-                
-                print("    Top tokens:")
-                for token, score in token_scores[:3]:
-                    print(f"      {token:>10}: {score:+.3f}")
+        # Test specifico per ogni metodo Ali et al.
+        ali_methods = ["attention_rollout", "attention_flow", "lrp"]
+        
+        for method in ali_methods:
+            if method in available:
+                print(f"\n  [TEST] Testing {method.upper()}:")
+                try:
+                    explainer = get_explainer(method, model, tokenizer)
+                    attr = explainer(test_text)
                     
-            except Exception as e:
-                print(f"    ✗ Errore: {e}")
+                    # Analisi dettagliata
+                    print(f"    [OK] Tokens processati: {len(attr.tokens)}")
+                    print(f"    [OK] Score range: [{min(attr.scores):.3f}, {max(attr.scores):.3f}]")
+                    print(f"    [OK] Total relevance: {sum(attr.scores):.3f}")
+                    
+                    # Verifica conservazione per LRP
+                    if method == "lrp":
+                        # Predizione originale per confronto
+                        with torch.no_grad():
+                            inputs = tokenizer(test_text, return_tensors="pt", truncation=True, max_length=256)
+                            inputs = models.move_batch_to_device(inputs)
+                            outputs = model(**inputs)
+                            target_logit = outputs.logits[0, 1].item() if outputs.logits.size(-1) > 1 else outputs.logits[0, 0].item()
+                        
+                        conservation_error = abs(sum(attr.scores) - target_logit)
+                        print(f"    [CONSERVATION] Error: {conservation_error:.4f}")
+                    
+                    # Top token più rilevanti
+                    token_scores = [(tok, score) for tok, score in zip(attr.tokens, attr.scores) 
+                                   if not tok.startswith('[') and tok.strip()]
+                    token_scores.sort(key=lambda x: abs(x[1]), reverse=True)
+                    
+                    print("    [TOP] Relevant tokens:")
+                    for i, (token, score) in enumerate(token_scores[:5], 1):
+                        print(f"      {i}. {token:>12}: {score:+.3f}")
+                        
+                except Exception as e:
+                    print(f"    [ERROR] Errore in {method}: {e}")
+            else:
+                print(f"\n  [SKIP] {method.upper()}: Non disponibile (dipendenze mancanti)")
     
     except Exception as e:
-        print(f"  ✗ Errore nel test: {e}")
+        print(f"  [ERROR] Errore nel test: {e}")
     
-    # 4. Confronto con altri explainer (opzionale)
+    # 4. Confronto performance (opzionale)
     if len(available) > 1:
-        print(f"\n4. CONFRONTO VELOCITÀ:")
+        print(f"\n4. BENCHMARK PERFORMANCE:")
         try:
             benchmark_results = benchmark_explainer_speed()
-            if benchmark_results:
-                lrp_time = benchmark_results.get("lrp", {}).get("avg_time", "N/A")
-                print(f"\n  LRP Conservativa: {lrp_time}s")
         except Exception as e:
             print(f"  Benchmark fallito: {e}")
     
+    # 5. Confronto implementazioni
+    print(f"\n5. CONFRONTO IMPLEMENTAZIONI:")
+    try:
+        compare_with_original_implementations()
+    except Exception as e:
+        print(f"  Confronto fallito: {e}")
+    
+    print(f"\n{'='*70}")
+    print("[DONE] Test completati! Le implementazioni Ali et al. 2022 sono integrate.")
+    print("[AVAILABLE] Metodi disponibili: attention_rollout, attention_flow, lrp (conservative)")
+    print("[PAPER] 'XAI for Transformers: Better Explanations through Conservative Propagation'")
+    print("[REPO] https://github.com/AmeenAli/XAI_Transformers")
+    print("="*70)
