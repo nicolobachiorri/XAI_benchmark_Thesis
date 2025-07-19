@@ -360,7 +360,7 @@ def _lime_text(model, tokenizer):
 
 # ==== SHAP ====
 def _kernel_shap(model, tokenizer):
-    """SHAP con pipeline transformers nativo."""
+    """SHAP con TextExplainer - ultimo tentativo."""
     if not SHAP_AVAILABLE:
         def explain(text: str) -> Attribution:
             return Attribution(["[NO_SHAP]"], [0.0])
@@ -368,29 +368,36 @@ def _kernel_shap(model, tokenizer):
     
     def explain(text: str) -> Attribution:
         try:
-            from transformers import pipeline
+            # Funzione prediction semplice
+            def predict_fn(texts):
+                results = []
+                for t in texts:
+                    encoded = tokenizer(t, return_tensors="pt", truncation=True, max_length=128)
+                    encoded = models.move_batch_to_device(encoded)
+                    
+                    with torch.no_grad():
+                        outputs = model(**encoded)
+                        prob = torch.softmax(outputs.logits, dim=-1)[0][1].item()
+                    results.append(prob)
+                
+                return np.array(results)
             
-            # Crea pipeline da modello e tokenizer esistenti
-            pipe = pipeline(
-                "sentiment-analysis", 
-                model=model, 
-                tokenizer=tokenizer,
-                return_all_scores=True,
-                device=0 if torch.cuda.is_available() else -1
-            )
+            # Usa PartitionExplainer invece di Explainer
+            explainer = shap.PartitionExplainer(predict_fn, shap.maskers.Text())
+            shap_values = explainer([text], max_evals=100)
             
-            # SHAP explainer diretto - come nell'esempio!
-            explainer = shap.Explainer(pipe)
-            shap_values = explainer([text])
+            # Estrai risultati  
+            words = text.split()
+            scores = shap_values.values[0]
             
-            # Estrai risultati
-            tokens = explainer.data[0]  # Token dal masker interno
-            scores = shap_values.values[0][:, 1]  # Classe POSITIVE
-            
-            return Attribution(tokens, scores.tolist())
+            # Truncate to same length
+            min_len = min(len(words), len(scores))
+            return Attribution(words[:min_len], scores[:min_len].tolist())
             
         except Exception as e:
-            print(f"[ERROR] SHAP pipeline failed: {e}")
+            print(f"[ERROR] SHAP failed: {e}")
+            import traceback
+            traceback.print_exc()
             return Attribution(["[ERROR]"], [0.0])
     
     return explain
