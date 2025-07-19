@@ -360,161 +360,40 @@ def _lime_text(model, tokenizer):
 
 # ==== SHAP ====
 def _kernel_shap(model, tokenizer):
-    """SHAP nativo per transformers."""
+    """SHAP con pipeline transformers nativo."""
     if not SHAP_AVAILABLE:
         def explain(text: str) -> Attribution:
-            print("[ERROR] SHAP not available")
             return Attribution(["[NO_SHAP]"], [0.0])
         return explain
     
     def explain(text: str) -> Attribution:
-        start_time = time.time()
         try:
-            # Crea pipeline function per SHAP
-            def pipeline_func(texts):
-                if isinstance(texts, str):
-                    texts = [texts]
-                
-                results = []
-                for t in texts:
-                    encoded = tokenizer(t, return_tensors="pt", truncation=True, max_length=128)
-                    encoded = models.move_batch_to_device(encoded)
-                    
-                    with torch.no_grad():
-                        outputs = model(**encoded)
-                        probs = torch.softmax(outputs.logits, dim=-1)
-                        results.append(float(probs[0][1]))  # Positive class probability
-                
-                return results
+            from transformers import pipeline
             
-            # Usa SHAP Explainer nativo
-            explainer = shap.Explainer(pipeline_func, shap.maskers.Text(tokenizer))
-            shap_values = explainer([text])
-            
-            # Estrai tokens e scores
-            tokens = text.split()  # Simple tokenization per ora
-            scores = shap_values.values[0].flatten()
-            
-            # Match lunghezze
-            min_len = min(len(tokens), len(scores))
-            tokens = tokens[:min_len]
-            scores = scores[:min_len].tolist()
-            
-            log_timing("shap", time.time() - start_time)
-            return Attribution(tokens, scores)
-            
-        except Exception as e:
-            print(f"[ERROR] SHAP native failed: {e}")
-            return Attribution(["[ERROR]"], [0.0])
-    
-    return explain
-            print("[ERROR] SHAP not available")
-            return Attribution(["[NO_SHAP]"], [0.0])
-        return explain
-    
-    def predict_proba(texts):
-        """Prediction function per SHAP."""
-        try:
-            # Assicura che texts sia una lista
-            if isinstance(texts, str):
-                texts = [texts]
-            
-            encoded = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128)
-            encoded = models.move_batch_to_device(encoded)
-            
-            with torch.no_grad():
-                logits = model(**encoded).logits
-                return F.softmax(logits, dim=-1).cpu().numpy()
-        except Exception as e:
-            print(f"[ERROR] SHAP prediction failed: {e}")
-            # Fallback: predizioni casuali
-            n_texts = len(texts) if isinstance(texts, list) else 1
-            return np.random.rand(n_texts, 2)
-    
-    def explain(text: str) -> Attribution:
-        start_time = time.time()
-        try:
-            words = text.split()[:8]  # Ridotto a 8 per stabilità
-            if len(words) == 0:
-                return Attribution(["[EMPTY]"], [0.0])
-            
-            def predict_for_shap(word_presence):
-                """Fixed prediction function for SHAP."""
-                try:
-                    # word_presence è una matrice numpy
-                    if word_presence.ndim == 1:
-                        word_presence = word_presence.reshape(1, -1)
-                    
-                    texts = []
-                    for row in word_presence:
-                        # Costruisce testo basato su presenza delle parole
-                        text_words = []
-                        for i, presence in enumerate(row):
-                            if i < len(words):  # Bounds check
-                                if float(presence) > 0.5:  # Explicit float conversion
-                                    text_words.append(words[i])
-                                else:
-                                    text_words.append("[MASK]")
-                        
-                        if not text_words:  # Se vuoto, usa testo default
-                            text_words = ["[MASK]"]
-                        
-                        texts.append(" ".join(text_words))
-                    
-                    return predict_proba(texts)
-                    
-                except Exception as e:
-                    print(f"[ERROR] predict_for_shap failed: {e}")
-                    # Fallback
-                    n_samples = len(word_presence) if hasattr(word_presence, '__len__') else 1
-                    return np.random.rand(n_samples, 2)
-            
-            # Background: tutti i token assenti
-            background = np.zeros((1, len(words)))
-            
-            # Test prediction function prima di usarla
-            test_input = np.ones((1, len(words)))
-            test_output = predict_for_shap(test_input)
-            if test_output.shape[1] != 2:
-                raise ValueError(f"Prediction function returned wrong shape: {test_output.shape}")
-            
-            # Crea explainer SHAP
-            explainer_obj = shap.KernelExplainer(predict_for_shap, background)
-            
-            # Calcola SHAP values
-            shap_values = explainer_obj.shap_values(
-                np.ones((1, len(words))), 
-                nsamples=15,  # Ridotto per velocità
-                silent=True
+            # Crea pipeline da modello e tokenizer esistenti
+            pipe = pipeline(
+                "sentiment-analysis", 
+                model=model, 
+                tokenizer=tokenizer,
+                return_all_scores=True,
+                device=0 if torch.cuda.is_available() else -1
             )
             
-            # Estrai scores
-            if isinstance(shap_values, list):
-                # Binary classification: usa classe positiva
-                scores = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
-            else:
-                scores = shap_values[0] if shap_values.ndim > 1 else shap_values
+            # SHAP explainer diretto - come nell'esempio!
+            explainer = shap.Explainer(pipe)
+            shap_values = explainer([text])
             
-            # Converti a lista
-            if hasattr(scores, 'tolist'):
-                scores = scores.tolist()
-            elif not isinstance(scores, list):
-                scores = [float(scores)] if np.isscalar(scores) else scores.flatten().tolist()
+            # Estrai risultati
+            tokens = explainer.data[0]  # Token dal masker interno
+            scores = shap_values.values[0][:, 1]  # Classe POSITIVE
             
-            # Assicura lunghezza corretta
-            scores = scores[:len(words)]
-            if len(scores) < len(words):
-                scores.extend([0.0] * (len(words) - len(scores)))
-            
-            log_timing("shap", time.time() - start_time)
-            return Attribution(words, scores)
+            return Attribution(tokens, scores.tolist())
             
         except Exception as e:
-            print(f"[ERROR] SHAP explanation failed: {e}")
+            print(f"[ERROR] SHAP pipeline failed: {e}")
             return Attribution(["[ERROR]"], [0.0])
     
     return explain
-
 # ==== Factory ====
 _EXPLAINERS = {
     "grad_input": _grad_input,
