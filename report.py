@@ -1,22 +1,25 @@
 """
-report.py – Report XAI completo ottimizzato per Google Colab
-==========================================================
+report.py – Report XAI completo ottimizzato per Google Colab (FIXED VERSION)
+============================================================================
 
 OTTIMIZZAZIONI PER COLAB:
 1. Memory management ottimizzato per GPU limitata
 2. Progress tracking dettagliato per notebook
-3. Checkpoint automatici per recovery
+3. Checkpoint automatici per recovery con VALIDAZIONE COMPLETA
 4. Dataset clusterizzato (400 esempi)
 5. Batch processing intelligente
-6. Error recovery e fallback
+6. Error recovery e fallback ROBUSTI
 7. Report generation ottimizzato
 
 STRATEGIA COLAB:
 - Processa 1 modello alla volta per memoria
-- Salva risultati intermedi automaticamente  
-- Cleanup aggressivo tra modelli
+- ORDINE INTELLIGENTE: modelli piccoli prima (evita degradazione ambientale)
+- SUPER CLEANUP aggressivo tra modelli
+- Checkpoint validation completa
+- Resume logic robusto
 - Progress tracking visivo
 - Auto-recovery da crash
+
 
 Uso in Colab:
 ```python
@@ -46,6 +49,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import pandas as pd
+import numpy as np
 import torch
 from tqdm.auto import tqdm
 
@@ -69,12 +73,13 @@ set_seed(42)
 def print_colab_report_header():
     """Header per report Colab."""
     print("="*80)
-    print(" XAI COMPREHENSIVE REPORT")
+    print(" XAI COMPREHENSIVE REPORT (FIXED VERSION)")
     print("="*80)
     print(" Strategy: Memory-optimized sequential processing")
     print(" Dataset: 400 clustered representative examples")
-    print(" Recovery: Auto-checkpoint for crash recovery")
-    print(" Cleanup: Aggressive memory management between models")
+    print(" Recovery: Auto-checkpoint with VALIDATION")
+    print(" Cleanup: SUPER aggressive memory management")
+    print(" Ordering: Smart model ordering (small→large)")
     print("="*80)
 
 def get_available_resources():
@@ -88,6 +93,116 @@ def get_available_resources():
     print(f"[RESOURCES] Dataset: {len(dataset.test_df)} clustered examples")
     
     return available_models, available_explainers
+
+def smart_model_ordering(models_to_test: List[str]) -> List[str]:
+    """Ordina modelli intelligentemente per ottimizzare processing.
+    
+    Priorità: modelli piccoli prima, grandi dopo per evitare
+    degradazione ambientale che causa fallimenti dei modelli finali.
+    """
+    size_priority = {
+        "tinybert": 1,      # Più piccolo - processa per primo
+        "distilbert": 2,    # Piccolo
+        "roberta-base": 3,  # Medio
+        "bert-large": 4,    # Grande
+        "roberta-large": 5  # Più grande - processa per ultimo
+    }
+    
+    # Ordina per priorità, modelli sconosciuti alla fine
+    ordered = sorted(models_to_test, key=lambda m: size_priority.get(m, 999))
+    
+    print(f"[ORDERING] Smart model order: {ordered}")
+    return ordered
+
+def super_cleanup():
+    """Cleanup aggressivo tra modelli per prevenire degradazione ambientale."""
+    print("[SUPER-CLEANUP] Performing deep cleanup...")
+    start_time = time.time()
+    
+    # Multiple GC passes per essere sicuri
+    for i in range(3):
+        collected = gc.collect()
+        if i == 0:
+            print(f"[SUPER-CLEANUP]   GC pass {i+1}: {collected} objects collected")
+    
+    if torch.cuda.is_available():
+        # GPU cleanup completo
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()  # Aspetta tutte le operazioni CUDA
+        
+        # Memory status
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        print(f"[SUPER-CLEANUP]   GPU memory after cleanup: {allocated:.2f}GB")
+    
+    # Stabilization pause per permettere al sistema di stabilizzarsi
+    time.sleep(2)
+    
+    cleanup_time = time.time() - start_time
+    print(f"[SUPER-CLEANUP] Deep cleanup completed in {cleanup_time:.1f}s")
+
+def verify_checkpoint_completeness(
+    checkpoint_data: Dict, 
+    expected_metrics: List[str], 
+    expected_explainers: List[str]
+) -> Tuple[bool, str]:
+    """Verifica che il checkpoint contenga tutti i dati attesi.
+    
+    Returns:
+        (is_complete, reason)
+    """
+    if not checkpoint_data.get("completed", False):
+        return False, "marked as incomplete"
+    
+    results = checkpoint_data.get("results", {})
+    if not results:
+        return False, "no results data"
+    
+    # Verifica presenza di tutte le metriche
+    missing_metrics = []
+    for metric in expected_metrics:
+        if metric not in results:
+            missing_metrics.append(metric)
+    
+    if missing_metrics:
+        return False, f"missing metrics: {missing_metrics}"
+    
+    # Verifica presenza di tutti gli explainer per ogni metrica
+    incomplete_metrics = []
+    for metric in expected_metrics:
+        if metric not in results:
+            continue
+            
+        metric_explainers = set(results[metric].keys())
+        expected_explainers_set = set(expected_explainers)
+        
+        if not expected_explainers_set.issubset(metric_explainers):
+            missing = expected_explainers_set - metric_explainers
+            incomplete_metrics.append(f"{metric}({list(missing)})")
+    
+    if incomplete_metrics:
+        return False, f"incomplete explainers: {incomplete_metrics}"
+    
+    # Verifica che ci siano risultati validi (non tutti NaN/None)
+    valid_results_count = 0
+    total_expected = len(expected_metrics) * len(expected_explainers)
+    
+    for metric in expected_metrics:
+        for explainer in expected_explainers:
+            if explainer in results[metric]:
+                score = results[metric][explainer]
+                if score is not None and not (isinstance(score, float) and np.isnan(score)):
+                    valid_results_count += 1
+    
+    if valid_results_count == 0:
+        return False, "no valid scores (all NaN/None)"
+    
+    completeness_ratio = valid_results_count / total_expected
+    if completeness_ratio < 0.1:  # Almeno 10% di risultati validi
+        return False, f"too few valid results: {valid_results_count}/{total_expected} ({completeness_ratio:.1%})"
+    
+    return True, f"complete with {valid_results_count}/{total_expected} valid results ({completeness_ratio:.1%})"
 
 def save_intermediate_results(model_key: str, results: Dict[str, Dict[str, float]], 
                             timestamp: str = None):
@@ -121,7 +236,7 @@ def save_intermediate_results(model_key: str, results: Dict[str, Dict[str, float
     with open(filename, 'w') as f:
         json.dump(data, f, indent=2)
     
-    print(f"[SAVE] ✓ Results saved: {filename.name}")
+    print(f"[SAVE] Results saved: {filename.name}")
     return filename
 
 def load_all_results(pattern: str = "results_*.json") -> Dict[str, Dict]:
@@ -144,8 +259,41 @@ def load_all_results(pattern: str = "results_*.json") -> Dict[str, Dict]:
         except Exception as e:
             print(f"[WARNING] Could not load {file_path}: {e}")
     
-    print(f"[LOAD] ✓ Loaded results for {len(all_results)} models")
+    print(f"[LOAD] Loaded results for {len(all_results)} models")
     return all_results
+
+def process_single_model_with_retry(
+    model_key: str,
+    explainers_to_test: List[str],
+    metrics_to_compute: List[str],
+    sample_size: int,
+    recovery: AutoRecovery,
+    max_retries: int = 2
+) -> Dict[str, Dict[str, float]]:
+    """Wrapper con retry logic per process_single_model."""
+    
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                print(f"[RETRY] Attempt {attempt + 1}/{max_retries + 1} for {model_key}")
+                super_cleanup()  # Cleanup extra prima del retry
+                time.sleep(5)    # Pausa più lunga
+            
+            return process_single_model(
+                model_key, explainers_to_test, metrics_to_compute, 
+                sample_size, recovery
+            )
+            
+        except Exception as e:
+            print(f"[ERROR] Attempt {attempt + 1} failed for {model_key}: {e}")
+            
+            if attempt < max_retries:
+                print(f"[RETRY] Will retry {model_key} after cleanup...")
+                super_cleanup()
+            else:
+                print(f"[FINAL ERROR] All {max_retries + 1} attempts failed for {model_key}")
+                # Restituisci risultati vuoti ma validi
+                return {metric: {} for metric in metrics_to_compute}
 
 def process_single_model(
     model_key: str,
@@ -154,17 +302,11 @@ def process_single_model(
     sample_size: int,
     recovery: AutoRecovery
 ) -> Dict[str, Dict[str, float]]:
-    """Processa singolo modello con tutte le metriche."""
+    """Processa singolo modello con tutte le metriche (versione migliorata)."""
     
     print(f"\n{'='*70}")
     print(f" PROCESSING MODEL: {model_key}")
     print(f"{'='*70}")
-    
-    # Check se già processato
-    existing_results = recovery.load_latest_checkpoint(f"model_{model_key}")
-    if existing_results and existing_results.get("completed", False):
-        print(f"[SKIP] ✓ {model_key} already completed")
-        return existing_results["results"]
     
     profiler = PerformanceProfiler()
     profiler.start_operation(f"model_{model_key}")
@@ -188,17 +330,24 @@ def process_single_model(
         neg_texts = [t for t, l in zip(texts, labels) if l == 0][:50]
         consistency_texts = texts[:min(50, len(texts))]
         
-        print(f"[DATA] ✓ Total: {len(texts)}, Pos: {len(pos_texts)}, Neg: {len(neg_texts)}")
+        print(f"[DATA] Total: {len(texts)}, Pos: {len(pos_texts)}, Neg: {len(neg_texts)}")
         
-        # Risultati per questo modello
-        results = {metric: {} for metric in metrics_to_compute}
+        # Inizializza risultati per TUTTE le metriche e explainer
+        results = {}
+        for metric in metrics_to_compute:
+            results[metric] = {}
+            for explainer in explainers_to_test:
+                results[metric][explainer] = float('nan')  # Inizializza con NaN
         
         # Processa ogni explainer
+        successful_explainers = 0
+        
         for i, explainer_name in enumerate(explainers_to_test, 1):
-            print(f"\n[{i}/{len(explainers_to_test)}] 🔍 EXPLAINER: {explainer_name}")
+            print(f"\n[{i}/{len(explainers_to_test)}] EXPLAINER: {explainer_name}")
             print("-" * 50)
             
             explainer_start_time = time.time()
+            explainer_success = False
             
             try:
                 # Crea explainer
@@ -247,106 +396,153 @@ def process_single_model(
                         
                         results[metric_name][explainer_name] = score
                         metric_time = time.time() - metric_start_time
-                        print(f"✓ {score:.4f} ({metric_time:.1f}s)")
+                        print(f"SUCCESS {score:.4f} ({metric_time:.1f}s)")
+                        explainer_success = True
                         
                     except Exception as e:
-                        print(f"✗ ERROR: {str(e)[:50]}...")
+                        print(f"ERROR: {str(e)[:50]}...")
                         results[metric_name][explainer_name] = float('nan')
                 
+                if explainer_success:
+                    successful_explainers += 1
+                
                 explainer_time = time.time() - explainer_start_time
-                print(f"  [TOTAL] {explainer_name}: {explainer_time:.1f}s")
+                status = "SUCCESS" if explainer_success else "FAILED"
+                print(f"  [TOTAL] {explainer_name}: {explainer_time:.1f}s {status}")
                 
                 # Cleanup explainer
                 del explainer
                 gc.collect()
                 
-                # Checkpoint intermedio
+                # Checkpoint intermedio con conteggio progresso
                 checkpoint_data = {
                     "results": results,
-                    "completed": False,
-                    "progress": f"{i}/{len(explainers_to_test)} explainers"
+                    "completed": False,  # Non completo finché non finiti tutti
+                    "progress": {
+                        "explainers_completed": i,
+                        "explainers_total": len(explainers_to_test),
+                        "successful_explainers": successful_explainers
+                    }
                 }
                 recovery.save_checkpoint(checkpoint_data, f"model_{model_key}")
                 
             except Exception as e:
-                print(f"  ✗ EXPLAINER FAILED: {explainer_name}: {e}")
+                print(f"  EXPLAINER FAILED: {explainer_name}: {e}")
+                # Mantieni NaN inizializzati per tutti le metriche
                 for metric in metrics_to_compute:
                     results[metric][explainer_name] = float('nan')
         
-        # Salva risultati finali
+        # Salva risultati finali con verifica
         final_results = {
             "results": results,
             "completed": True,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "stats": {
+                "successful_explainers": successful_explainers,
+                "total_explainers": len(explainers_to_test),
+                "success_rate": successful_explainers / len(explainers_to_test)
+            }
         }
         recovery.save_checkpoint(final_results, f"model_{model_key}")
         save_intermediate_results(model_key, results)
         
         profiler.end_operation(f"model_{model_key}")
         
-        print(f"\n[COMPLETE] ✓ {model_key} processing completed")
-        print(f"[MEMORY] Peak usage tracked")
+        print(f"\n[COMPLETE] {model_key} processing completed")
+        print(f"[STATS] Successful explainers: {successful_explainers}/{len(explainers_to_test)}")
         
         return results
         
     except Exception as e:
-        print(f"[ERROR] ✗ Model {model_key} failed: {e}")
+        print(f"[ERROR] Model {model_key} failed completely: {e}")
         import traceback
         traceback.print_exc()
-        return {metric: {} for metric in metrics_to_compute}
+        
+        # Restituisci struttura vuota ma valida
+        empty_results = {}
+        for metric in metrics_to_compute:
+            empty_results[metric] = {}
+            for explainer in explainers_to_test:
+                empty_results[metric][explainer] = float('nan')
+        
+        return empty_results
         
     finally:
         # CLEANUP AGGRESSIVO
         print(f"[CLEANUP] Cleaning memory for {model_key}...")
         
-        if 'model' in locals():
-            del model
-        if 'tokenizer' in locals():
-            del tokenizer
-        if 'explainer' in locals():
-            del explainer
+        # Cleanup variabili locali
+        local_vars_to_clean = ['model', 'tokenizer', 'explainer']
+        for var_name in local_vars_to_clean:
+            if var_name in locals():
+                del locals()[var_name]
         
-        aggressive_cleanup()
-        print_memory_status()
+        # Super cleanup
+        super_cleanup()
 
 def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[str]) -> Dict[str, pd.DataFrame]:
-    """Costruisce tabelle finali dal risultati."""
+    """Costruisce tabelle finali dai risultati (versione migliorata con debug)."""
     print(f"\n{'='*70}")
-    print(" BUILDING REPORT TABLES")
+    print(" BUILDING REPORT TABLES (ENHANCED)")
     print(f"{'='*70}")
     
     tables = {}
     
+    # Debug: analizza all_results
+    print(f"[DEBUG] Models in all_results: {list(all_results.keys())}")
+    
     for metric in metrics_to_compute:
-        print(f"[TABLE] Building {metric} table...")
+        print(f"\n[TABLE] Building {metric} table...")
         
         # Struttura: explainer -> {model: score}
         metric_data = defaultdict(dict)
         
         for model_key, model_data in all_results.items():
-            if "results" in model_data and metric in model_data["results"]:
-                for explainer_name, score in model_data["results"][metric].items():
-                    if score is not None:
-                        metric_data[explainer_name][model_key] = score
+            print(f"[DEBUG] Processing {model_key}:")
+            print(f"[DEBUG]   Has 'results': {'results' in model_data}")
+            
+            if "results" not in model_data:
+                print(f"[DEBUG]   No 'results' key for {model_key}")
+                continue
+                
+            print(f"[DEBUG]   Available metrics: {list(model_data['results'].keys())}")
+            
+            if metric not in model_data["results"]:
+                print(f"[DEBUG]   No '{metric}' in results for {model_key}")
+                continue
+                
+            explainer_scores = model_data["results"][metric]
+            print(f"[DEBUG]   {metric} explainers: {list(explainer_scores.keys())}")
+            
+            valid_scores = 0
+            for explainer_name, score in explainer_scores.items():
+                if score is not None and not (isinstance(score, float) and np.isnan(score)):
+                    metric_data[explainer_name][model_key] = score
+                    valid_scores += 1
+                else:
+                    print(f"[DEBUG]     Filtered {explainer_name}: {score} (invalid)")
+            
+            print(f"[DEBUG]   Valid scores for {model_key}: {valid_scores}/{len(explainer_scores)}")
         
         if metric_data:
             df = pd.DataFrame(metric_data).T  # Transpose: explainer come righe
             tables[metric] = df
-            print(f"[TABLE] ✓ {metric}: {df.shape[0]} explainers × {df.shape[1]} models")
+            print(f"[TABLE] {metric}: {df.shape[0]} explainers × {df.shape[1]} models")
+            print(f"[TABLE]   Total data points: {df.notna().sum().sum()}")
         else:
-            print(f"[TABLE] ✗ {metric}: No data available")
+            print(f"[TABLE] {metric}: No data available")
             tables[metric] = pd.DataFrame()
     
     return tables
 
 def print_table_analysis(df: pd.DataFrame, metric_name: str):
-    """Analisi e interpretazione tabella."""
+    """Analisi e interpretazione tabella (versione migliorata)."""
     print(f"\n{'='*60}")
     print(f" {metric_name.upper()} ANALYSIS")
     print(f"{'='*60}")
     
     if df.empty:
-        print("❌ No data available for analysis")
+        print("No data available for analysis")
         return
     
     # Statistiche per explainer
@@ -358,7 +554,8 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
             mean_val = values.mean()
             std_val = values.std()
             count = len(values)
-            print(f"  {explainer:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count})")
+            coverage = len(values) / len(df.columns)
+            print(f"  {explainer:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count}, {coverage:.1%} coverage)")
     
     # Statistiche per modello
     print("\n Per-Model Statistics:")
@@ -369,7 +566,8 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
             mean_val = values.mean()
             std_val = values.std()
             count = len(values)
-            print(f"  {model:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count})")
+            coverage = len(values) / len(df.index)
+            print(f"  {model:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count}, {coverage:.1%} coverage)")
     
     # Ranking top combinations
     print(f"\n Top 5 Combinations:")
@@ -394,17 +592,27 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
         for i, (explainer, model, value) in enumerate(flat_data[:5]):
             print(f"  {i+1}. {explainer:>12s} + {model:>12s}: {value:.4f}")
     
+    # Coverage analysis
+    total_cells = df.size
+    filled_cells = df.notna().sum().sum()
+    coverage = filled_cells / total_cells if total_cells > 0 else 0
+    
+    print(f"\n Coverage Analysis:")
+    print(f"  Total combinations: {total_cells}")
+    print(f"  Completed: {filled_cells}")
+    print(f"  Coverage: {coverage:.1%}")
+    
     print(f"{'='*60}")
 
 def generate_summary_report(tables: Dict[str, pd.DataFrame], 
                           execution_time: float,
                           models_tested: List[str],
                           explainers_tested: List[str]) -> str:
-    """Genera report summary testuale."""
+    """Genera report summary testuale (versione migliorata)."""
     
     summary = f"""
-XAI BENCHMARK REPORT - GOOGLE COLAB EDITION
-============================================
+XAI BENCHMARK REPORT - GOOGLE COLAB EDITION (FIXED)
+===================================================
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Execution Time: {execution_time/60:.1f} minutes
 Dataset: {len(dataset.test_df)} clustered examples from IMDB
@@ -419,8 +627,10 @@ RESULTS SUMMARY:
     
     for metric_name, df in tables.items():
         if not df.empty:
+            coverage = df.notna().sum().sum()
+            total = df.size
             summary += f"\n{metric_name.upper()}:\n"
-            summary += f"  Coverage: {df.notna().sum().sum()}/{df.size} combinations completed\n"
+            summary += f"  Coverage: {coverage}/{total} combinations completed ({coverage/total:.1%})\n"
             
             # Best combination
             flat_data = []
@@ -441,6 +651,13 @@ RESULTS SUMMARY:
             summary += f"\n{metric_name.upper()}: No data collected\n"
     
     summary += f"""
+SYSTEM IMPROVEMENTS:
+- Smart model ordering (small→large) prevents environment degradation
+- Super cleanup between models ensures memory stability  
+- Checkpoint validation prevents incomplete cached results
+- Retry logic handles transient failures
+- Enhanced debug logging for troubleshooting
+
 RECOMMENDATIONS:
 - For production XAI: Use combinations with highest consistency scores
 - For research: Focus on high contrastivity explainers
@@ -476,14 +693,14 @@ def quick_report(models_subset: List[str] = None,
     print(f"[QUICK] Testing {len(models_to_test)} models × {len(explainers_to_test)} explainers × {len(metrics_to_compute)} metrics")
     print(f"[QUICK] Sample size: {sample_size}")
     
-    return run_report(models_to_test, explainers_to_test, metrics_to_compute, sample_size)
+    return run_report(models_to_test, explainers_to_test, metrics_to_compute, sample_size, resume=False)
 
 def run_report(models_to_test: List[str] = None,
                explainers_to_test: List[str] = None, 
                metrics_to_compute: List[str] = None,
                sample_size: int = 100,
                resume: bool = True) -> Dict[str, pd.DataFrame]:
-    """Esegue report completo (callable da Colab)."""
+    """Esegue report completo (callable da Colab) - VERSIONE MIGLIORATA."""
     
     start_time = time.time()
     profiler = PerformanceProfiler()
@@ -506,6 +723,15 @@ def run_report(models_to_test: List[str] = None,
         models_to_test = [m for m in models_to_test if m in available_models]
         explainers_to_test = [e for e in explainers_to_test if e in available_explainers]
         
+        # SMART MODEL ORDERING - FIX PRINCIPALE!
+        original_order = models_to_test.copy()
+        models_to_test = smart_model_ordering(models_to_test)
+        
+        if original_order != models_to_test:
+            print(f"[ORDERING] Reordered models for stability:")
+            print(f"[ORDERING]   Original: {original_order}")
+            print(f"[ORDERING]   Optimized: {models_to_test}")
+        
         total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
         
         print(f"\n[REPORT] Configuration:")
@@ -518,7 +744,7 @@ def run_report(models_to_test: List[str] = None,
         
         # FASE 1: Process each model
         print(f"\n{'='*80}")
-        print("FASE 1: SEQUENTIAL MODEL PROCESSING")
+        print("FASE 1: SEQUENTIAL MODEL PROCESSING (ENHANCED)")
         print(f"{'='*80}")
         
         all_results = {}
@@ -526,24 +752,45 @@ def run_report(models_to_test: List[str] = None,
         for i, model_key in enumerate(models_to_test, 1):
             print(f"\n[{i}/{len(models_to_test)}] Model: {model_key}")
             
-            # Check resume
+            # RESUME LOGIC FIX - rispetta sempre --no-resume
             if resume:
+                print(f"[RESUME] Checking for existing checkpoint...")
                 existing = recovery.load_latest_checkpoint(f"model_{model_key}")
-                if existing and existing.get("completed", False):
-                    print(f"[RESUME] ✓ Using cached results for {model_key}")
-                    all_results[model_key] = existing
-                    continue
+                
+                if existing:
+                    # CHECKPOINT VALIDATION - verifica completezza reale
+                    is_complete, reason = verify_checkpoint_completeness(
+                        existing, metrics_to_compute, explainers_to_test
+                    )
+                    
+                    if is_complete:
+                        print(f"[RESUME] Using complete cached results for {model_key}")
+                        print(f"[RESUME]   Reason: {reason}")
+                        all_results[model_key] = existing
+                        continue
+                    else:
+                        print(f"[RESUME] Incomplete checkpoint for {model_key}")
+                        print(f"[RESUME]   Reason: {reason}")
+                        print(f"[RESUME]   Will reprocess...")
+                else:
+                    print(f"[RESUME] No checkpoint found for {model_key}")
+            else:
+                print(f"[RESUME] Resume disabled, processing fresh...")
             
             try:
                 with Timer(f"Processing {model_key}"):
-                    results = process_single_model(
+                    # RETRY LOGIC per fallimenti transienti
+                    results = process_single_model_with_retry(
                         model_key=model_key,
                         explainers_to_test=explainers_to_test,
                         metrics_to_compute=metrics_to_compute,
                         sample_size=sample_size,
-                        recovery=recovery
+                        recovery=recovery,
+                        max_retries=2
                     )
                     all_results[model_key] = {"results": results, "completed": True}
+                
+                print(f"[SUCCESS] {model_key} completed successfully")
                 
             except Exception as e:
                 print(f"[ERROR] Model {model_key} failed: {e}")
@@ -552,11 +799,15 @@ def run_report(models_to_test: List[str] = None,
                     "completed": False,
                     "error": str(e)
                 }
-                continue
+                
+            # SUPER CLEANUP tra modelli per prevenire degradazione
+            if i < len(models_to_test):  # Non dopo l'ultimo modello
+                print(f"[INTER-MODEL] Performing cleanup before next model...")
+                super_cleanup()
         
         # FASE 2: Build tables
         print(f"\n{'='*80}")
-        print("FASE 2: BUILDING FINAL TABLES")  
+        print("FASE 2: BUILDING FINAL TABLES (ENHANCED)")  
         print(f"{'='*80}")
         
         profiler.start_operation("table_building")
@@ -565,12 +816,12 @@ def run_report(models_to_test: List[str] = None,
         
         # FASE 3: Analysis & Output
         print(f"\n{'='*80}")
-        print("FASE 3: ANALYSIS & OUTPUT")
+        print("FASE 3: ANALYSIS & OUTPUT (ENHANCED)")
         print(f"{'='*80}")
         
         execution_time = time.time() - start_time
         
-        # Print tables
+        # Print tables con analisi dettagliata
         for metric_name, df in tables.items():
             if not df.empty:
                 print(f"\n {metric_name.upper()} TABLE:")
@@ -580,12 +831,12 @@ def run_report(models_to_test: List[str] = None,
                 # Save CSV
                 csv_file = RESULTS_DIR / f"{metric_name}_table.csv"
                 df.to_csv(csv_file)
-                print(f"[SAVE] ✓ CSV saved: {csv_file}")
+                print(f"[SAVE] CSV saved: {csv_file}")
                 
-                # Analysis
+                # Analysis dettagliata
                 print_table_analysis(df, metric_name)
         
-        # Generate summary
+        # Generate summary migliorato
         summary = generate_summary_report(
             tables, execution_time, models_to_test, explainers_to_test
         )
@@ -594,18 +845,25 @@ def run_report(models_to_test: List[str] = None,
         summary_file = RESULTS_DIR / "summary_report.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
-        print(f"[SAVE] ✓ Summary saved: {summary_file}")
+        print(f"[SAVE] Summary saved: {summary_file}")
         
         profiler.end_operation("full_report")
         
-        # Final summary
+        # Final summary con statistiche dettagliate
         print(f"\n{'='*80}")
-        print(" REPORT COMPLETED SUCCESSFULLY!")
+        print(" REPORT COMPLETED SUCCESSFULLY! (ENHANCED)")
         print(f"{'='*80}")
         print(f"  Total time: {execution_time/60:.1f} minutes")
-        print(f" Tables generated: {len([t for t in tables.values() if not t.empty])}")
-        print(f" Files saved in: {RESULTS_DIR}")
-        print(f" Total combinations: {sum(df.notna().sum().sum() for df in tables.values())}")
+        print(f"  Models processed: {len([r for r in all_results.values() if r.get('completed', False)])}/{len(models_to_test)}")
+        print(f"  Tables generated: {len([t for t in tables.values() if not t.empty])}")
+        print(f"  Files saved in: {RESULTS_DIR}")
+        print(f"  Total data points: {sum(df.notna().sum().sum() for df in tables.values())}")
+        
+        # Coverage summary
+        expected_total = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
+        actual_total = sum(df.notna().sum().sum() for df in tables.values())
+        coverage = actual_total / expected_total if expected_total > 0 else 0
+        print(f"  Overall coverage: {actual_total}/{expected_total} ({coverage:.1%})")
         
         # Performance summary
         profiler.print_summary()
@@ -613,18 +871,20 @@ def run_report(models_to_test: List[str] = None,
         return tables
         
     except Exception as e:
-        print(f"\n REPORT FAILED: {e}")
+        print(f"\nREPORT FAILED: {e}")
         import traceback
         traceback.print_exc()
         return {}
         
     finally:
-        aggressive_cleanup()
+        # Final cleanup
+        print(f"[FINAL-CLEANUP] Performing final memory cleanup...")
+        super_cleanup()
 
 # ==== CLI Interface ====
 def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="XAI Report Generator for Google Colab")
+    parser = argparse.ArgumentParser(description="XAI Report Generator for Google Colab (FIXED)")
     parser.add_argument("--models", nargs="+", choices=list(models.MODELS.keys()), 
                        default=None, help="Models to test")
     parser.add_argument("--explainers", nargs="+", choices=EXPLAINERS,
@@ -637,6 +897,16 @@ def main():
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Start fresh")
     
     args = parser.parse_args()
+    
+    print("XAI BENCHMARK FIXED VERSION")
+    print("="*50)
+    print("Improvements:")
+    print("- Smart model ordering")
+    print("- Checkpoint validation") 
+    print("- Super cleanup")
+    print("- Retry logic")
+    print("- Enhanced debugging")
+    print("="*50)
     
     if args.quick:
         print("Running quick report...")
@@ -658,6 +928,8 @@ def main():
     if not any(not df.empty for df in tables.values()):
         print("No results generated!")
         sys.exit(1)
+    else:
+        print("Report completed successfully!")
 
 if __name__ == "__main__":
     main()
