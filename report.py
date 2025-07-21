@@ -85,7 +85,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Configurazione parallelizzazione
 MAX_WORKERS = min(4, mp.cpu_count())  # Limita per Colab
-PARALLEL_EXPLAINERS = ["lime", "shap"]  # Explainer sicuri per parallelizzazione
+PARALLEL_EXPLAINERS = ["lime"]  # Explainer sicuri per parallelizzazione
 MEMORY_THRESHOLD_GB = 2.0  # Soglia minima memoria per ottimizzazioni
 
 set_seed(42)
@@ -313,7 +313,7 @@ class ParallelExplainerManager:
         self.process_pool = None  # Inizializzato quando necessario
         self.explainer_compatibility = {
             "lime": {"parallel": True, "thread_safe": True},
-            "shap": {"parallel": True, "thread_safe": True},
+            "shap": {"parallel": False, "thread_safe": False},
             "grad_input": {"parallel": False, "thread_safe": False},  # Usa GPU
             "attention_rollout": {"parallel": False, "thread_safe": False},
             "attention_flow": {"parallel": False, "thread_safe": False},
