@@ -1,37 +1,38 @@
 """
-report_optimized.py – Report XAI con ottimizzazioni avanzate per Google Colab
-================================================================================
+report.py – Report XAI semplificato senza parallelizzazione explainer
+====================================================================
 
-NUOVE OTTIMIZZAZIONI IMPLEMENTATE:
+OTTIMIZZAZIONI MANTENUTE:
 1. Adaptive Batch Size: Dimensioni batch dinamiche basate su memoria disponibile
-2. Explainer Parallelization: Esecuzione parallela di LIME + SHAP + altri explainer
-3. Embedding Caching: Cache intelligente per embeddings e tokenizzazioni
-4. Memory Management: Cleanup progressivo tra batch con monitoraggio
-5. GPU Optimization: CUDA sync ottimizzato, memory pool management
-6. Thread Pools: I/O operations parallele per salvataggio/caricamento
-7. Smart Resource Allocation: Allocazione dinamica risorse per explainer
+2. Embedding Caching: Cache intelligente per embeddings e tokenizzazioni
+3. Memory Management: Cleanup progressivo tra batch con monitoraggio
+4. GPU Optimization: CUDA sync ottimizzato, memory pool management
+5. Thread Pools: I/O operations parallele per salvataggio/caricamento
+6. Smart Resource Allocation: Allocazione dinamica risorse
 
-STRATEGIA AVANZATA:
-- Auto-detection memoria disponibile
-- Parallelizzazione intelligente explainer compatibili
-- Cache persistente embeddings tra modelli
-- Thread pool per I/O non-bloccante
-- Garbage collection ottimizzato per GPU
-- Batch size adattivo per massima throughput
+RIMOSSE:
+- Parallelizzazione explainer (over-engineering con benefici marginali)
+- Complessità thread-safety per explainer
+- Split parallel/sequential explainer
+
+STRATEGIA SEMPLIFICATA:
+- Processing sequenziale di tutti gli explainer
+- Ottimizzazioni focalizzate su memory management e caching
+- Codice più semplice e manutenibile
+- Speedup dalle ottimizzazioni realmente impattanti
 
 Uso in Colab:
 ```python
-import report_optimized as report
+import report
 
-# Report ultra-veloce con tutte le ottimizzazioni
+# Report ultra-veloce
 report.turbo_report()
 
-# Report personalizzato con controllo ottimizzazioni
+# Report personalizzato
 report.run_optimized_report(
     models=["tinybert", "distilbert"],
     explainers=["lime", "shap", "grad_input"], 
     metrics=["robustness", "consistency"],
-    enable_parallel=True,
     enable_caching=True,
     adaptive_batching=True
 )
@@ -43,22 +44,18 @@ import gc
 import json
 import time
 import sys
-import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import hashlib
-import queue
 import weakref
 
 import pandas as pd
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 import psutil
 
@@ -69,7 +66,7 @@ import metrics
 from utils import Timer, PerformanceProfiler, AutoRecovery, print_memory_status, aggressive_cleanup, set_seed
 
 # =============================================================================
-# CONFIGURAZIONE OTTIMIZZAZIONI AVANZATE
+# CONFIGURAZIONE OTTIMIZZAZIONI SEMPLIFICATA
 # =============================================================================
 
 # Configurazione base
@@ -83,9 +80,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 RESULTS_DIR = Path("xai_results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Configurazione parallelizzazione
-MAX_WORKERS = min(4, mp.cpu_count())  # Limita per Colab
-PARALLEL_EXPLAINERS = ["lime"]  # Explainer sicuri per parallelizzazione
+# Configurazione semplificata (no parallelization)
 MEMORY_THRESHOLD_GB = 2.0  # Soglia minima memoria per ottimizzazioni
 
 set_seed(42)
@@ -134,7 +129,6 @@ class AdvancedMemoryManager:
         """Abilita memory pool GPU per allocazioni efficienti."""
         if torch.cuda.is_available() and not self.gpu_memory_pool_enabled:
             try:
-                # Configura memory pool per allocazioni efficienti
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
                 
@@ -155,7 +149,6 @@ class AdvancedMemoryManager:
         if level == "light":
             gc.collect()
         elif level == "medium":
-            # Cleanup standard
             for _ in range(2):
                 collected = gc.collect()
             
@@ -163,7 +156,6 @@ class AdvancedMemoryManager:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
         elif level == "aggressive":
-            # Cleanup aggressivo
             for _ in range(3):
                 gc.collect()
             
@@ -173,7 +165,6 @@ class AdvancedMemoryManager:
                 torch.cuda.reset_peak_memory_stats()
                 torch.cuda.synchronize()
             
-            # Callback personalizzati
             for callback in self.cleanup_callbacks:
                 try:
                     callback()
@@ -219,12 +210,10 @@ class EmbeddingCache:
         """Ottieni embedding dalla cache."""
         cache_key = self._get_cache_key(model_key, text, "embedding")
         
-        # Controlla memory cache prima
         if cache_key in self.memory_cache:
             self.cache_stats["hits"] += 1
             return self.memory_cache[cache_key].clone()
         
-        # Controlla disk cache
         cache_path = self._get_cache_path(cache_key)
         if cache_path.exists():
             try:
@@ -243,10 +232,8 @@ class EmbeddingCache:
         """Salva embedding in cache."""
         cache_key = self._get_cache_key(model_key, text, "embedding")
         
-        # Salva in memory cache
         self.memory_cache[cache_key] = embedding.clone()
         
-        # Salva in disk cache (async)
         cache_path = self._get_cache_path(cache_key)
         try:
             with open(cache_path, 'wb') as f:
@@ -254,42 +241,6 @@ class EmbeddingCache:
             self.cache_stats["saves"] += 1
         except Exception as e:
             print(f"[CACHE] Failed to save {cache_path}: {e}")
-    
-    def get_tokenization(self, model_key: str, text: str) -> Optional[Dict]:
-        """Ottieni tokenizzazione dalla cache."""
-        cache_key = self._get_cache_key(model_key, text, "tokenization")
-        
-        if cache_key in self.memory_cache:
-            self.cache_stats["hits"] += 1
-            return self.memory_cache[cache_key].copy()
-        
-        cache_path = self._get_cache_path(cache_key)
-        if cache_path.exists():
-            try:
-                with open(cache_path, 'rb') as f:
-                    tokenization = pickle.load(f)
-                self.memory_cache[cache_key] = tokenization
-                self.cache_stats["hits"] += 1
-                return tokenization.copy()
-            except Exception as e:
-                print(f"[CACHE] Failed to load tokenization {cache_path}: {e}")
-        
-        self.cache_stats["misses"] += 1
-        return None
-    
-    def save_tokenization(self, model_key: str, text: str, tokenization: Dict):
-        """Salva tokenizzazione in cache."""
-        cache_key = self._get_cache_key(model_key, text, "tokenization")
-        
-        self.memory_cache[cache_key] = tokenization.copy()
-        
-        cache_path = self._get_cache_path(cache_key)
-        try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(tokenization, f)
-            self.cache_stats["saves"] += 1
-        except Exception as e:
-            print(f"[CACHE] Failed to save tokenization {cache_path}: {e}")
     
     def print_stats(self):
         """Stampa statistiche cache."""
@@ -299,80 +250,6 @@ class EmbeddingCache:
               f"{self.cache_stats['misses']} misses, "
               f"{hit_rate:.1%} hit rate, "
               f"{self.cache_stats['saves']} saves")
-
-# =============================================================================
-# PARALLELIZZAZIONE EXPLAINER
-# =============================================================================
-
-class ParallelExplainerManager:
-    """Gestione parallelizzazione explainer con resource allocation."""
-    
-    def __init__(self, max_workers: int = MAX_WORKERS):
-        self.max_workers = max_workers
-        self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
-        self.process_pool = None  # Inizializzato quando necessario
-        self.explainer_compatibility = {
-            "lime": {"parallel": True, "thread_safe": True},
-            "shap": {"parallel": False, "thread_safe": False},
-            "grad_input": {"parallel": False, "thread_safe": False},  # Usa GPU
-            "attention_rollout": {"parallel": False, "thread_safe": False},
-            "attention_flow": {"parallel": False, "thread_safe": False},
-            "lrp": {"parallel": False, "thread_safe": False}
-        }
-    
-    def can_parallelize(self, explainer_names: List[str]) -> bool:
-        """Verifica se gli explainer possono essere parallelizzati."""
-        return all(
-            self.explainer_compatibility.get(name, {}).get("parallel", False)
-            for name in explainer_names
-        )
-    
-    def split_explainers(self, explainer_names: List[str]) -> Tuple[List[str], List[str]]:
-        """Divide explainer in parallelizzabili e sequenziali."""
-        parallel = []
-        sequential = []
-        
-        for name in explainer_names:
-            if self.explainer_compatibility.get(name, {}).get("parallel", False):
-                parallel.append(name)
-            else:
-                sequential.append(name)
-        
-        return parallel, sequential
-    
-    def run_explainers_parallel(self, 
-                               explainer_tasks: List[Tuple[str, callable]], 
-                               timeout: int = 300) -> Dict[str, Any]:
-        """Esegue explainer in parallelo con timeout."""
-        print(f"[PARALLEL] Running {len(explainer_tasks)} explainers in parallel")
-        
-        futures = {}
-        results = {}
-        
-        # Sottometti task
-        for explainer_name, task_func in explainer_tasks:
-            future = self.thread_pool.submit(task_func)
-            futures[future] = explainer_name
-        
-        # Raccoglie risultati con timeout
-        for future in as_completed(futures, timeout=timeout):
-            explainer_name = futures[future]
-            try:
-                result = future.result(timeout=30)  # Timeout per singolo task
-                results[explainer_name] = result
-                print(f"[PARALLEL] {explainer_name}: SUCCESS")
-            except Exception as e:
-                print(f"[PARALLEL] {explainer_name}: FAILED - {e}")
-                results[explainer_name] = None
-        
-        return results
-    
-    def cleanup(self):
-        """Cleanup thread pool."""
-        if self.thread_pool:
-            self.thread_pool.shutdown(wait=False)
-        if self.process_pool:
-            self.process_pool.shutdown(wait=False)
 
 # =============================================================================
 # I/O THREAD POOL
@@ -409,18 +286,19 @@ class AsyncIOManager:
     
     def wait_all(self, timeout: int = 60):
         """Aspetta completamento di tutte le operazioni pending."""
-        print(f"[ASYNC-IO] Waiting for {len(self.pending_operations)} pending operations...")
-        
-        completed = 0
-        for future in as_completed(self.pending_operations, timeout=timeout):
-            try:
-                future.result()
-                completed += 1
-            except Exception as e:
-                print(f"[ASYNC-IO] Operation failed: {e}")
-        
-        print(f"[ASYNC-IO] Completed {completed}/{len(self.pending_operations)} operations")
-        self.pending_operations.clear()
+        if self.pending_operations:
+            print(f"[ASYNC-IO] Waiting for {len(self.pending_operations)} pending operations...")
+            
+            completed = 0
+            for future in as_completed(self.pending_operations, timeout=timeout):
+                try:
+                    future.result()
+                    completed += 1
+                except Exception as e:
+                    print(f"[ASYNC-IO] Operation failed: {e}")
+            
+            print(f"[ASYNC-IO] Completed {completed}/{len(self.pending_operations)} operations")
+            self.pending_operations.clear()
     
     def cleanup(self):
         """Cleanup I/O pool."""
@@ -431,18 +309,22 @@ class AsyncIOManager:
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def print_optimized_header():
-    """Header per report ottimizzato."""
+def print_simplified_header():
+    """Header per report semplificato."""
     print("="*80)
-    print(" XAI COMPREHENSIVE REPORT - OPTIMIZED VERSION")
+    print(" XAI COMPREHENSIVE REPORT - SIMPLIFIED VERSION")
     print("="*80)
     print(" Optimizations:")
     print("   - Adaptive batch sizing based on available memory")
-    print("   - Parallel explainer execution (LIME + SHAP)")
     print("   - Intelligent embedding/tokenization caching")
     print("   - Advanced GPU memory management")
     print("   - Asynchronous I/O operations")
     print("   - Progressive memory cleanup")
+    print(" ")
+    print(" Simplified:")
+    print("   - Sequential explainer processing (more reliable)")
+    print("   - Removed explainer parallelization complexity")
+    print("   - Focus on high-impact optimizations")
     print("="*80)
 
 def get_system_resources():
@@ -461,7 +343,7 @@ def get_system_resources():
     gpu_text = "Yes" if gpu_info['available'] else "No"
     if gpu_info['available']:
         gpu_text += f" ({gpu_info['memory_gb']:.1f}GB)"
-    print(f"[SYSTEM] GPU: {gpu_text}") 
+    print(f"[SYSTEM] GPU: {gpu_text}")
     
     return {
         "ram_total_gb": ram_gb,
@@ -470,30 +352,28 @@ def get_system_resources():
         "gpu_info": gpu_info
     }
 
-def process_model_optimized(
+def process_model_simplified(
     model_key: str,
     explainers_to_test: List[str],
     metrics_to_compute: List[str],
     sample_size: int,
-    enable_parallel: bool = True,
     enable_caching: bool = True,
     adaptive_batching: bool = True,
     recovery: AutoRecovery = None
 ) -> Dict[str, Dict[str, float]]:
-    """Processa singolo modello con tutte le ottimizzazioni."""
+    """Processa singolo modello con ottimizzazioni semplificate."""
     
     print(f"\n{'='*70}")
-    print(f" PROCESSING MODEL: {model_key} (OPTIMIZED)")
+    print(f" PROCESSING MODEL: {model_key} (SIMPLIFIED)")
     print(f"{'='*70}")
     
     # Inizializza manager
     memory_manager = AdvancedMemoryManager()
     embedding_cache = EmbeddingCache() if enable_caching else None
-    parallel_manager = ParallelExplainerManager() if enable_parallel else None
     async_io = AsyncIOManager()
     
     profiler = PerformanceProfiler()
-    profiler.start_operation(f"model_{model_key}_optimized")
+    profiler.start_operation(f"model_{model_key}_simplified")
     
     try:
         # Abilita ottimizzazioni GPU
@@ -539,165 +419,132 @@ def process_model_optimized(
             for explainer in explainers_to_test:
                 results[metric][explainer] = float('nan')
         
-        # Dividi explainer per parallelizzazione
-        if enable_parallel and parallel_manager:
-            parallel_explainers, sequential_explainers = parallel_manager.split_explainers(explainers_to_test)
-            print(f"[PARALLEL] Parallel: {parallel_explainers}, Sequential: {sequential_explainers}")
-        else:
-            parallel_explainers, sequential_explainers = [], explainers_to_test
+        # PROCESSING SEQUENZIALE SEMPLIFICATO
+        print(f"\n[PROCESSING] Sequential processing of {len(explainers_to_test)} explainers...")
         
-        # FASE 1: Explainer paralleli
-        if parallel_explainers:
-            print(f"\n[PHASE 1] Processing {len(parallel_explainers)} explainers in parallel...")
+        successful_explainers = 0
+        
+        for i, explainer_name in enumerate(explainers_to_test, 1):
+            print(f"\n[{i}/{len(explainers_to_test)}] Processing {explainer_name}...")
+            print("-" * 50)
             
-            def create_explainer_task(explainer_name):
-                def task():
+            explainer_start_time = time.time()
+            explainer_success = False
+            
+            try:
+                # Crea explainer
+                explainer = explainers.get_explainer(explainer_name, model, tokenizer)
+                
+                # Processa ogni metrica
+                for metric_name in metrics_to_compute:
+                    print(f"  [METRIC] {metric_name}...", end=" ")
+                    metric_start_time = time.time()
+                    
                     try:
-                        explainer = explainers.get_explainer(explainer_name, model, tokenizer)
-                        explainer_results = {}
-                        
-                        for metric_name in metrics_to_compute:
-                            try:
-                                if metric_name == "robustness":
-                                    score = metrics.evaluate_robustness_over_dataset(
-                                        model, tokenizer, explainer, consistency_texts, show_progress=False
-                                    )
-                                elif metric_name == "contrastivity":
-                                    # Usa batch processing ottimizzato
-                                    pos_attrs = metrics.process_attributions_batch(
-                                        pos_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                                    )
-                                    neg_attrs = metrics.process_attributions_batch(
-                                        neg_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                                    )
-                                    
-                                    pos_attrs = [attr for attr in pos_attrs if attr.tokens and attr.scores]
-                                    neg_attrs = [attr for attr in neg_attrs if attr.tokens and attr.scores]
-                                    
-                                    if pos_attrs and neg_attrs:
-                                        score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
-                                    else:
-                                        score = 0.0
-                                        
-                                elif metric_name == "consistency":
-                                    score = metrics.evaluate_consistency_over_dataset(
-                                        model=model,
-                                        tokenizer=tokenizer,
-                                        explainer=explainer,
-                                        texts=consistency_texts,
-                                        seeds=DEFAULT_CONSISTENCY_SEEDS,
-                                        show_progress=False
-                                    )
-                                else:
-                                    score = float('nan')
-                                
-                                explainer_results[metric_name] = score
-                                
-                            except Exception as e:
-                                print(f"[PARALLEL] {explainer_name}.{metric_name} failed: {e}")
-                                explainer_results[metric_name] = float('nan')
+                        if metric_name == "robustness":
+                            score = metrics.evaluate_robustness_over_dataset(
+                                model, tokenizer, explainer, consistency_texts, show_progress=False
+                            )
                             
-                            # Memory cleanup progressivo
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
+                        elif metric_name == "contrastivity":
+                            # Process in batch per memoria
+                            pos_attrs = metrics.process_attributions_batch(
+                                pos_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
+                            )
+                            neg_attrs = metrics.process_attributions_batch(
+                                neg_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
+                            )
+                            
+                            # Filter valid
+                            pos_attrs = [attr for attr in pos_attrs if attr.tokens and attr.scores]
+                            neg_attrs = [attr for attr in neg_attrs if attr.tokens and attr.scores]
+                            
+                            if pos_attrs and neg_attrs:
+                                score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
+                            else:
+                                score = 0.0
+                                
+                        elif metric_name == "consistency":
+                            score = metrics.evaluate_consistency_over_dataset(
+                                model=model,
+                                tokenizer=tokenizer,
+                                explainer=explainer,
+                                texts=consistency_texts,
+                                seeds=DEFAULT_CONSISTENCY_SEEDS,
+                                show_progress=False
+                            )
+                        else:
+                            score = float('nan')
                         
-                        return explainer_results
+                        results[metric_name][explainer_name] = score
+                        metric_time = time.time() - metric_start_time
+                        print(f"SUCCESS {score:.4f} ({metric_time:.1f}s)")
+                        explainer_success = True
                         
                     except Exception as e:
-                        print(f"[PARALLEL] {explainer_name} task completely failed: {e}")
-                        return {metric: float('nan') for metric in metrics_to_compute}
+                        print(f"ERROR: {str(e)[:50]}...")
+                        results[metric_name][explainer_name] = float('nan')
                 
-                return task
-            
-            # Esegui task paralleli
-            parallel_tasks = [(name, create_explainer_task(name)) for name in parallel_explainers]
-            parallel_results = parallel_manager.run_explainers_parallel(parallel_tasks)
-            
-            # Integra risultati paralleli
-            for explainer_name, explainer_results in parallel_results.items():
-                if explainer_results:
-                    for metric_name, score in explainer_results.items():
-                        results[metric_name][explainer_name] = score
-            
-            # Cleanup dopo parallelizzazione
-            memory_manager.progressive_cleanup("medium")
-        
-        # FASE 2: Explainer sequenziali (GPU-intensive)
-        if sequential_explainers:
-            print(f"\n[PHASE 2] Processing {len(sequential_explainers)} explainers sequentially...")
-            
-            for i, explainer_name in enumerate(sequential_explainers, 1):
-                print(f"[{i}/{len(sequential_explainers)}] {explainer_name}...")
+                if explainer_success:
+                    successful_explainers += 1
                 
-                try:
-                    explainer = explainers.get_explainer(explainer_name, model, tokenizer)
-                    
-                    for metric_name in metrics_to_compute:
-                        print(f"  [{metric_name}]...", end=" ")
-                        
-                        try:
-                            if metric_name == "robustness":
-                                score = metrics.evaluate_robustness_over_dataset(
-                                    model, tokenizer, explainer, consistency_texts, show_progress=False
-                                )
-                            elif metric_name == "contrastivity":
-                                pos_attrs = metrics.process_attributions_batch(
-                                    pos_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                                )
-                                neg_attrs = metrics.process_attributions_batch(
-                                    neg_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                                )
-                                
-                                pos_attrs = [attr for attr in pos_attrs if attr.tokens and attr.scores]
-                                neg_attrs = [attr for attr in neg_attrs if attr.tokens and attr.scores]
-                                
-                                if pos_attrs and neg_attrs:
-                                    score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
-                                else:
-                                    score = 0.0
-                                    
-                            elif metric_name == "consistency":
-                                score = metrics.evaluate_consistency_over_dataset(
-                                    model=model,
-                                    tokenizer=tokenizer,
-                                    explainer=explainer,
-                                    texts=consistency_texts,
-                                    seeds=DEFAULT_CONSISTENCY_SEEDS,
-                                    show_progress=False
-                                )
-                            else:
-                                score = float('nan')
-                            
-                            results[metric_name][explainer_name] = score
-                            print(f"SUCCESS {score:.4f}")
-                            
-                        except Exception as e:
-                            print(f"ERROR: {str(e)[:30]}...")
-                            results[metric_name][explainer_name] = float('nan')
-                    
-                    del explainer
-                    memory_manager.progressive_cleanup("light")
-                    
-                except Exception as e:
-                    print(f"  EXPLAINER FAILED: {explainer_name}: {e}")
-                    for metric in metrics_to_compute:
-                        results[metric][explainer_name] = float('nan')
+                explainer_time = time.time() - explainer_start_time
+                status = "SUCCESS" if explainer_success else "FAILED"
+                print(f"  [TOTAL] {explainer_name}: {explainer_time:.1f}s {status}")
+                
+                # Cleanup explainer
+                del explainer
+                memory_manager.progressive_cleanup("light")
+                
+                # Checkpoint intermedio
+                checkpoint_data = {
+                    "results": results,
+                    "completed": False,
+                    "progress": {
+                        "explainers_completed": i,
+                        "explainers_total": len(explainers_to_test),
+                        "successful_explainers": successful_explainers
+                    }
+                }
+                if recovery:
+                    recovery.save_checkpoint(checkpoint_data, f"model_{model_key}")
+                
+            except Exception as e:
+                print(f"  EXPLAINER FAILED: {explainer_name}: {e}")
+                for metric in metrics_to_compute:
+                    results[metric][explainer_name] = float('nan')
         
-        # Salvataggio asincrono risultati
+        # Salva risultati finali
+        final_results = {
+            "results": results,
+            "completed": True,
+            "timestamp": datetime.now().isoformat(),
+            "stats": {
+                "successful_explainers": successful_explainers,
+                "total_explainers": len(explainers_to_test),
+                "success_rate": successful_explainers / len(explainers_to_test)
+            }
+        }
+        if recovery:
+            recovery.save_checkpoint(final_results, f"model_{model_key}")
+        
+        # Salvataggio asincrono
         if async_io:
-            async_io.save_async(results, RESULTS_DIR / f"results_{model_key}_optimized.json")
+            async_io.save_async(results, RESULTS_DIR / f"results_{model_key}_simplified.json")
         
-        profiler.end_operation(f"model_{model_key}_optimized")
+        profiler.end_operation(f"model_{model_key}_simplified")
         
         # Stampa statistiche cache
         if embedding_cache:
             embedding_cache.print_stats()
         
-        print(f"\n[COMPLETE] {model_key} optimized processing completed")
+        print(f"\n[COMPLETE] {model_key} simplified processing completed")
+        print(f"[STATS] Successful explainers: {successful_explainers}/{len(explainers_to_test)}")
+        
         return results
         
     except Exception as e:
-        print(f"[ERROR] Model {model_key} optimized processing failed: {e}")
+        print(f"[ERROR] Model {model_key} simplified processing failed: {e}")
         import traceback
         traceback.print_exc()
         
@@ -714,8 +561,6 @@ def process_model_optimized(
         # Cleanup finale
         print(f"[CLEANUP] Final cleanup for {model_key}...")
         
-        if parallel_manager:
-            parallel_manager.cleanup()
         if async_io:
             async_io.cleanup()
         
@@ -731,9 +576,7 @@ def smart_model_ordering(models_to_test: List[str]) -> List[str]:
         "roberta-large": 5  # Più grande - processa per ultimo
     }
     
-    # Ordina per priorità, modelli sconosciuti alla fine
     ordered = sorted(models_to_test, key=lambda m: size_priority.get(m, 999))
-    
     print(f"[ORDERING] Smart model order: {ordered}")
     return ordered
 
@@ -775,7 +618,7 @@ def verify_checkpoint_completeness(
     if incomplete_metrics:
         return False, f"incomplete explainers: {incomplete_metrics}"
     
-    # Verifica che ci siano risultati validi (non tutti NaN/None)
+    # Verifica che ci siano risultati validi
     valid_results_count = 0
     total_expected = len(expected_metrics) * len(expected_explainers)
     
@@ -790,7 +633,7 @@ def verify_checkpoint_completeness(
         return False, "no valid scores (all NaN/None)"
     
     completeness_ratio = valid_results_count / total_expected
-    if completeness_ratio < 0.1:  # Almeno 10% di risultati validi
+    if completeness_ratio < 0.1:
         return False, f"too few valid results: {valid_results_count}/{total_expected} ({completeness_ratio:.1%})"
     
     return True, f"complete with {valid_results_count}/{total_expected} valid results ({completeness_ratio:.1%})"
@@ -798,7 +641,7 @@ def verify_checkpoint_completeness(
 def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[str]) -> Dict[str, pd.DataFrame]:
     """Costruisce tabelle finali dai risultati."""
     print(f"\n{'='*70}")
-    print(" BUILDING REPORT TABLES (OPTIMIZED)")
+    print(" BUILDING REPORT TABLES (SIMPLIFIED)")
     print(f"{'='*70}")
     
     tables = {}
@@ -806,7 +649,6 @@ def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[s
     for metric in metrics_to_compute:
         print(f"\n[TABLE] Building {metric} table...")
         
-        # Struttura: explainer -> {model: score}
         metric_data = defaultdict(dict)
         
         for model_key, model_data in all_results.items():
@@ -823,7 +665,7 @@ def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[s
                     metric_data[explainer_name][model_key] = score
         
         if metric_data:
-            df = pd.DataFrame(metric_data).T  # Transpose: explainer come righe
+            df = pd.DataFrame(metric_data).T
             tables[metric] = df
             print(f"[TABLE] {metric}: {df.shape[0]} explainers × {df.shape[1]} models")
         else:
@@ -877,7 +719,6 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
                 flat_data.append((explainer, model, value))
     
     if flat_data:
-        # Sort appropriately per metric
         if metric_name == "robustness":
             flat_data.sort(key=lambda x: x[2])  # Lower is better
             direction = "(Lower = Better)"
@@ -907,8 +748,8 @@ def generate_summary_report(tables: Dict[str, pd.DataFrame],
     """Genera report summary testuale."""
     
     summary = f"""
-XAI BENCHMARK REPORT - OPTIMIZED VERSION
-=========================================
+XAI BENCHMARK REPORT - SIMPLIFIED VERSION
+==========================================
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Execution Time: {execution_time/60:.1f} minutes
 Dataset: {len(dataset.test_df)} clustered examples from IMDB
@@ -919,11 +760,11 @@ CONFIGURATION:
 - Metrics computed: {len(tables)} ({', '.join(tables.keys())})
 
 OPTIMIZATIONS ENABLED:
-- Parallel Processing: {'✓' if optimizations_used.get('parallel', False) else '✗'}
 - Embedding Caching: {'✓' if optimizations_used.get('caching', False) else '✗'}
 - Adaptive Batching: {'✓' if optimizations_used.get('adaptive_batching', False) else '✗'}
 - GPU Memory Pool: {'✓' if optimizations_used.get('gpu_optimization', False) else '✗'}
 - Async I/O: {'✓' if optimizations_used.get('async_io', False) else '✗'}
+- Sequential Processing: ✓ (simplified architecture)
 
 RESULTS SUMMARY:
 """
@@ -954,12 +795,12 @@ RESULTS SUMMARY:
             summary += f"\n{metric_name.upper()}: No data collected\n"
     
     summary += f"""
-OPTIMIZATION BENEFITS:
-- Smart model ordering prevents environment degradation
-- Parallel explainer execution reduces processing time
-- Embedding cache eliminates redundant computations
-- Adaptive batching maximizes memory utilization
-- Advanced cleanup ensures system stability
+SIMPLIFIED ARCHITECTURE BENEFITS:
+- Removed explainer parallelization complexity
+- More reliable sequential processing
+- Focus on high-impact optimizations (caching, batching, memory)
+- Simpler code maintenance and debugging
+- Consistent performance across all explainers
 
 RECOMMENDATIONS:
 - For production XAI: Use combinations with highest consistency scores
@@ -967,9 +808,9 @@ RECOMMENDATIONS:
 - For deployment: Balance robustness vs computational cost
 
 Files Generated:
-- Raw results: {RESULTS_DIR}/results_*_optimized.json
+- Raw results: {RESULTS_DIR}/results_*_simplified.json
 - CSV tables: {RESULTS_DIR}/*_table.csv
-- Summary: {RESULTS_DIR}/summary_report_optimized.txt
+- Summary: {RESULTS_DIR}/summary_report_simplified.txt
 """
     
     return summary
@@ -978,26 +819,25 @@ Files Generated:
 # MAIN REPORT FUNCTIONS
 # =============================================================================
 
-def run_optimized_report(
+def run_simplified_report(
     models_to_test: List[str] = None,
     explainers_to_test: List[str] = None, 
     metrics_to_compute: List[str] = None,
     sample_size: int = 100,
-    enable_parallel: bool = True,
     enable_caching: bool = True,
     adaptive_batching: bool = True,
     resume: bool = True
 ) -> Dict[str, pd.DataFrame]:
-    """Esegue report completo con tutte le ottimizzazioni."""
+    """Esegue report completo con architettura semplificata."""
     
     start_time = time.time()
     profiler = PerformanceProfiler()
     recovery = AutoRecovery(checkpoint_dir=RESULTS_DIR / "checkpoints")
     
-    profiler.start_operation("optimized_report")
+    profiler.start_operation("simplified_report")
     
     try:
-        print_optimized_header()
+        print_simplified_header()
         
         # Analizza risorse sistema
         system_resources = get_system_resources()
@@ -1016,28 +856,27 @@ def run_optimized_report(
         models_to_test = [m for m in models_to_test if m in available_models]
         explainers_to_test = [e for e in explainers_to_test if e in available_explainers]
         
-        # SMART MODEL ORDERING
+        # Smart model ordering
         models_to_test = smart_model_ordering(models_to_test)
         
         # Disabilita ottimizzazioni se risorse insufficienti
         if system_resources["ram_available_gb"] < MEMORY_THRESHOLD_GB:
             print(f"[WARNING] Low memory ({system_resources['ram_available_gb']:.1f}GB), disabling some optimizations")
-            enable_parallel = False
             adaptive_batching = False
         
         total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
         
-        print(f"\n[REPORT] Optimized Configuration:")
+        print(f"\n[REPORT] Simplified Configuration:")
         print(f"  Models: {models_to_test}")
         print(f"  Explainers: {explainers_to_test}")
         print(f"  Metrics: {metrics_to_compute}")
         print(f"  Sample size: {sample_size}")
         print(f"  Total combinations: {total_combinations}")
-        print(f"  Optimizations: Parallel={enable_parallel}, Cache={enable_caching}, Adaptive={adaptive_batching}")
+        print(f"  Optimizations: Cache={enable_caching}, Adaptive={adaptive_batching}")
         
-        # FASE 1: Process each model with optimizations
+        # FASE 1: Process each model sequentially
         print(f"\n{'='*80}")
-        print("FASE 1: OPTIMIZED MODEL PROCESSING")
+        print("FASE 1: SIMPLIFIED MODEL PROCESSING")
         print(f"{'='*80}")
         
         all_results = {}
@@ -1063,13 +902,12 @@ def run_optimized_report(
                         print(f"[RESUME] Incomplete checkpoint: {reason}")
             
             try:
-                with Timer(f"Processing {model_key} (optimized)"):
-                    results = process_model_optimized(
+                with Timer(f"Processing {model_key} (simplified)"):
+                    results = process_model_simplified(
                         model_key=model_key,
                         explainers_to_test=explainers_to_test,
                         metrics_to_compute=metrics_to_compute,
                         sample_size=sample_size,
-                        enable_parallel=enable_parallel,
                         enable_caching=enable_caching,
                         adaptive_batching=adaptive_batching,
                         recovery=recovery
@@ -1088,7 +926,7 @@ def run_optimized_report(
         
         # FASE 2: Build tables
         print(f"\n{'='*80}")
-        print("FASE 2: BUILDING OPTIMIZED TABLES")
+        print("FASE 2: BUILDING SIMPLIFIED TABLES")
         print(f"{'='*80}")
         
         profiler.start_operation("table_building")
@@ -1097,7 +935,7 @@ def run_optimized_report(
         
         # FASE 3: Analysis & Output
         print(f"\n{'='*80}")
-        print("FASE 3: OPTIMIZED ANALYSIS & OUTPUT")
+        print("FASE 3: SIMPLIFIED ANALYSIS & OUTPUT")
         print(f"{'='*80}")
         
         execution_time = time.time() - start_time
@@ -1110,20 +948,20 @@ def run_optimized_report(
                 print(df.to_string(float_format="%.4f", na_rep="—"))
                 
                 # Save CSV
-                csv_file = RESULTS_DIR / f"{metric_name}_table_optimized.csv"
+                csv_file = RESULTS_DIR / f"{metric_name}_table_simplified.csv"
                 df.to_csv(csv_file)
                 print(f"[SAVE] CSV saved: {csv_file}")
                 
                 # Analysis
                 print_table_analysis(df, metric_name)
         
-        # Generate optimized summary
+        # Generate simplified summary
         optimizations_used = {
-            "parallel": enable_parallel,
             "caching": enable_caching,
             "adaptive_batching": adaptive_batching,
             "gpu_optimization": torch.cuda.is_available(),
-            "async_io": True
+            "async_io": True,
+            "sequential_processing": True
         }
         
         summary = generate_summary_report(
@@ -1131,16 +969,16 @@ def run_optimized_report(
         )
         
         # Save summary
-        summary_file = RESULTS_DIR / "summary_report_optimized.txt"
+        summary_file = RESULTS_DIR / "summary_report_simplified.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(f"[SAVE] Summary saved: {summary_file}")
         
-        profiler.end_operation("optimized_report")
+        profiler.end_operation("simplified_report")
         
         # Final summary
         print(f"\n{'='*80}")
-        print(" OPTIMIZED REPORT COMPLETED SUCCESSFULLY!")
+        print(" SIMPLIFIED REPORT COMPLETED SUCCESSFULLY!")
         print(f"{'='*80}")
         print(f"  Total time: {execution_time/60:.1f} minutes")
         print(f"  Models processed: {len([r for r in all_results.values() if r.get('completed', False)])}/{len(models_to_test)}")
@@ -1154,27 +992,26 @@ def run_optimized_report(
         return tables
         
     except Exception as e:
-        print(f"\nOPTIMIZED REPORT FAILED: {e}")
+        print(f"\nSIMPLIFIED REPORT FAILED: {e}")
         import traceback
         traceback.print_exc()
         return {}
 
 def turbo_report(sample_size: int = 50) -> Dict[str, pd.DataFrame]:
-    """Report ultra-veloce con tutte le ottimizzazioni abilitate."""
-    print_optimized_header()
-    print("[TURBO] Ultra-fast report with all optimizations enabled")
+    """Report ultra-veloce con architettura semplificata."""
+    print_simplified_header()
+    print("[TURBO] Ultra-fast report with simplified architecture")
     
     # Configuration for maximum speed
     models_subset = ["tinybert", "distilbert"]  # Fastest models
-    explainers_subset = ["lime", "shap"]       # Parallel-friendly explainers
+    explainers_subset = ["lime", "grad_input"]  # Fast explainers
     metrics_subset = ["robustness"]            # Single metric for speed
     
-    return run_optimized_report(
+    return run_simplified_report(
         models_to_test=models_subset,
         explainers_to_test=explainers_subset,
         metrics_to_compute=metrics_subset,
         sample_size=sample_size,
-        enable_parallel=True,
         enable_caching=True,
         adaptive_batching=True,
         resume=True
@@ -1192,13 +1029,16 @@ def get_available_resources():
     
     return available_models, available_explainers
 
+# Alias per compatibilità
+run_optimized_report = run_simplified_report
+
 # =============================================================================
 # CLI INTERFACE
 # =============================================================================
 
 def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="XAI Report Generator - Optimized Version")
+    parser = argparse.ArgumentParser(description="XAI Report Generator - Simplified Version")
     parser.add_argument("--models", nargs="+", choices=list(models.MODELS.keys()), 
                        default=None, help="Models to test")
     parser.add_argument("--explainers", nargs="+", choices=EXPLAINERS,
@@ -1207,7 +1047,6 @@ def main():
                        default=None, help="Metrics to compute")
     parser.add_argument("--sample", type=int, default=100, help="Sample size")
     parser.add_argument("--turbo", action="store_true", help="Ultra-fast turbo report")
-    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching")
     parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive batching")
     parser.add_argument("--resume", action="store_true", default=True, help="Resume from checkpoints")
@@ -1215,11 +1054,14 @@ def main():
     
     args = parser.parse_args()
     
-    print("XAI BENCHMARK - OPTIMIZED VERSION")
+    print("XAI BENCHMARK - SIMPLIFIED VERSION")
     print("="*50)
+    print("Simplifications:")
+    print("- Sequential explainer processing")
+    print("- Removed parallelization complexity") 
+    print("- Focus on high-impact optimizations")
     print("Optimizations:")
     print("- Adaptive batch sizing")
-    print("- Parallel explainer execution") 
     print("- Intelligent caching")
     print("- Advanced memory management")
     print("- GPU optimizations")
@@ -1230,13 +1072,12 @@ def main():
         print("Running turbo report...")
         tables = turbo_report(sample_size=min(args.sample, 50))
     else:
-        print("Running optimized report...")
-        tables = run_optimized_report(
+        print("Running simplified report...")
+        tables = run_simplified_report(
             models_to_test=args.models,
             explainers_to_test=args.explainers,
             metrics_to_compute=args.metrics,
             sample_size=args.sample,
-            enable_parallel=not args.no_parallel,
             enable_caching=not args.no_cache,
             adaptive_batching=not args.no_adaptive,
             resume=args.resume
@@ -1246,7 +1087,7 @@ def main():
         print("No results generated!")
         sys.exit(1)
     else:
-        print("Optimized report completed successfully!")
+        print("Simplified report completed successfully!")
 
 if __name__ == "__main__":
     main()
