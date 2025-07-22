@@ -10,16 +10,6 @@ OTTIMIZZAZIONI MANTENUTE:
 5. Thread Pools: I/O operations parallele per salvataggio/caricamento
 6. Smart Resource Allocation: Allocazione dinamica risorse
 
-RIMOSSE:
-- Parallelizzazione explainer (over-engineering con benefici marginali)
-- Complessità thread-safety per explainer
-- Split parallel/sequential explainer
-
-STRATEGIA SEMPLIFICATA:
-- Processing sequenziale di tutti gli explainer
-- Ottimizzazioni focalizzate su memory management e caching
-- Codice più semplice e manutenibile
-- Speedup dalle ottimizzazioni realmente impattanti
 
 Uso in Colab:
 ```python
@@ -44,6 +34,8 @@ import gc
 import json
 import time
 import sys
+import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Union
 from collections import defaultdict
@@ -304,6 +296,165 @@ class AsyncIOManager:
         """Cleanup I/O pool."""
         self.wait_all()
         self.io_pool.shutdown(wait=True)
+
+# =============================================================================
+# GOOGLE DRIVE BACKUP FUNCTIONS
+# =============================================================================
+
+def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str = "XAI_Results") -> bool:
+    """Backup automatico risultati su Google Drive."""
+    
+    # Controlla se Google Drive è montato
+    drive_path = Path("/content/drive")
+    if not drive_path.exists():
+        print("[DRIVE] Google Drive not mounted. Mounting now...")
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+            print("[DRIVE] ✓ Google Drive mounted successfully")
+        except Exception as e:
+            print(f"[DRIVE] Failed to mount Google Drive: {e}")
+            return False
+    
+    # Path di destinazione su Drive
+    drive_backup_dir = Path(f"/content/drive/MyDrive/{drive_folder}")
+    
+    # Crea cartella timestampata
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_dir = drive_backup_dir / f"report_{timestamp}"
+    timestamped_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n{'='*80}")
+    print("GOOGLE DRIVE BACKUP")
+    print(f"{'='*80}")
+    print(f"Destination: {timestamped_dir}")
+    
+    results_path = Path(results_dir)
+    
+    if not results_path.exists():
+        print("[DRIVE] Results directory not found")
+        return False
+    
+    # Trova file da copiare
+    files_to_copy = []
+    
+    # CSV tables
+    csv_files = list(results_path.glob("*_table*.csv"))
+    files_to_copy.extend(csv_files)
+    
+    # JSON results
+    json_files = list(results_path.glob("results_*.json"))
+    files_to_copy.extend(json_files)
+    
+    # Summary reports
+    summary_files = list(results_path.glob("summary_report*.txt"))
+    files_to_copy.extend(summary_files)
+    
+    if not files_to_copy:
+        print("[DRIVE] No files found to backup")
+        return False
+    
+    print(f"[DRIVE] Found {len(files_to_copy)} files to backup")
+    
+    # Copia file
+    copied_files = 0
+    failed_files = 0
+    
+    for file_path in files_to_copy:
+        try:
+            destination = timestamped_dir / file_path.name
+            
+            if file_path.suffix == '.json':
+                # Per JSON, copia e comprimi se grande
+                if file_path.stat().st_size > 1024*1024:  # > 1MB
+                    print(f"[DRIVE] Copying large file: {file_path.name}")
+                else:
+                    print(f"[DRIVE] Copying: {file_path.name}")
+            else:
+                print(f"[DRIVE] Copying: {file_path.name}")
+            
+            # Copia file
+            shutil.copy2(file_path, destination)
+            copied_files += 1
+            
+        except Exception as e:
+            print(f"[DRIVE] Failed to copy {file_path.name}: {e}")
+            failed_files += 1
+    
+    # Crea file di metadata
+    try:
+        metadata = {
+            "timestamp": timestamp,
+            "datetime": datetime.now().isoformat(),
+            "files_copied": copied_files,
+            "files_failed": failed_files,
+            "total_files": len(files_to_copy),
+            "colab_session": True,
+            "backup_type": "automatic"
+        }
+        
+        metadata_file = timestamped_dir / "backup_metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"[DRIVE] Created metadata file")
+        
+    except Exception as e:
+        print(f"[DRIVE] Failed to create metadata: {e}")
+    
+    # Summary
+    success_rate = copied_files / len(files_to_copy) if files_to_copy else 0
+    
+    print(f"\n[DRIVE] Backup Summary:")
+    print(f"  Copied: {copied_files}/{len(files_to_copy)} files ({success_rate:.1%})")
+    print(f"  Failed: {failed_files}")
+    print(f"  Location: {timestamped_dir}")
+    
+    if copied_files > 0:
+        print(f"  ✓ Results safely backed up to Google Drive!")
+        print(f"  Access via: My Drive > {drive_folder} > report_{timestamp}")
+    
+    return success_rate > 0.8  # Success se almeno 80% files copied
+
+def quick_drive_backup(results_dir: str = "xai_results") -> bool:
+    """Backup veloce solo CSV tables su Drive."""
+    
+    # Controlla Drive mount
+    if not Path("/content/drive").exists():
+        try:
+            from google.colab import drive
+            drive.mount('/content/drive')
+        except:
+            print("[DRIVE] Cannot mount Google Drive")
+            return False
+    
+    # Path semplificato
+    drive_dir = Path("/content/drive/MyDrive/XAI_Results")
+    drive_dir.mkdir(exist_ok=True)
+    
+    results_path = Path(results_dir)
+    csv_files = list(results_path.glob("*_table*.csv"))
+    
+    if not csv_files:
+        return False
+    
+    print(f"[DRIVE] Quick backup: {len(csv_files)} CSV files")
+    
+    copied = 0
+    for csv_file in csv_files:
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            dest_name = f"{timestamp}_{csv_file.name}"
+            dest_path = drive_dir / dest_name
+            
+            shutil.copy2(csv_file, dest_path)
+            copied += 1
+            print(f"[DRIVE] ✓ {csv_file.name}")
+            
+        except Exception as e:
+            print(f"[DRIVE] ✗ {csv_file.name}: {e}")
+    
+    return copied > 0
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -826,7 +977,9 @@ def run_simplified_report(
     sample_size: int = 100,
     enable_caching: bool = True,
     adaptive_batching: bool = True,
-    resume: bool = True
+    resume: bool = True,
+    drive_folder: str = "XAI_Results",
+    no_backup: bool = False
 ) -> Dict[str, pd.DataFrame]:
     """Esegue report completo con architettura semplificata."""
     
@@ -989,6 +1142,18 @@ def run_simplified_report(
         # Performance summary
         profiler.print_summary()
         
+        # GOOGLE DRIVE BACKUP AUTOMATICO
+        if not no_backup:
+            try:
+                backup_results_to_drive(str(RESULTS_DIR), drive_folder)
+            except Exception as e:
+                print(f"[DRIVE] Backup failed: {e}")
+                print("[DRIVE] Trying quick CSV backup...")
+                try:
+                    quick_drive_backup(str(RESULTS_DIR))
+                except:
+                    print("[DRIVE] Quick backup also failed")
+        
         return tables
         
     except Exception as e:
@@ -1051,6 +1216,8 @@ def main():
     parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive batching")
     parser.add_argument("--resume", action="store_true", default=True, help="Resume from checkpoints")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Start fresh")
+    parser.add_argument("--drive-folder", default="XAI_Results", help="Google Drive folder name")
+    parser.add_argument("--no-backup", action="store_true", help="Disable automatic backup")
     
     args = parser.parse_args()
     
@@ -1080,7 +1247,9 @@ def main():
             sample_size=args.sample,
             enable_caching=not args.no_cache,
             adaptive_batching=not args.no_adaptive,
-            resume=args.resume
+            resume=args.resume,
+            drive_folder=args.drive_folder,
+            no_backup=args.no_backup
         )
     
     if not any(not df.empty for df in tables.values()):
