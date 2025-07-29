@@ -1,10 +1,10 @@
 # XAI Benchmark Framework
 
-Framework completo per la valutazione di metodi di eXplainable AI su modelli di sentiment analysis, ottimizzato per Google Colab con avanzate ottimizzazioni delle prestazioni.
+Framework completo per la valutazione di metodi di eXplainable AI su modelli di sentiment analysis, ottimizzato per Google Colab.
 
 ## Introduzione
 
-Questo framework valuta la qualità delle spiegazioni generate da diversi metodi XAI su modelli pre-addestrati per l'analisi del sentiment. Il sistema utilizza **clustering intelligente** per ridurre il dataset IMDB da 25.000 a 400 esempi rappresentativi (80 cluster × 5 campioni), mantenendo la diversità e il bilanciamento dei dati.
+Questo framework valuta la qualità delle spiegazioni generate da diversi metodi XAI su modelli pre-addestrati per l'analisi del sentiment. Il sistema utilizza **clustering intelligente** per ridurre il dataset IMDB da 5.000 a 400 esempi rappresentativi (80 cluster × 5 campioni), mantenendo la diversità e il bilanciamento dei dati.
 
 Il framework è specificamente progettato per Google Colab con gestione avanzata della memoria GPU, caching intelligente e backup automatico su Google Drive.
 
