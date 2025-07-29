@@ -1,108 +1,100 @@
-# XAI Benchmark per Modelli di Sentiment Analysis
+# XAI Benchmark Framework
 
-Questo progetto implementa un framework per valutare tecniche di Explainable AI (XAI) su modelli Transformer pre-addestrati per sentiment analysis. Il benchmark confronta **5 modelli diversi** con **5 metodi di spiegazione** usando **3 metriche automatiche**.
+Framework completo per la valutazione di metodi di eXplainable AI su modelli di sentiment analysis, ottimizzato per Google Colab con avanzate ottimizzazioni delle prestazioni.
 
-## Panoramica del Framework
+## Introduzione
 
-```
-Dataset IMDB → 5 Modelli Pre-trained → 5 Explainer XAI → 3 Metriche Automatiche → Report Comparative
-```
+Questo framework valuta la qualità delle spiegazioni generate da diversi metodi XAI su modelli pre-addestrati per l'analisi del sentiment. Il sistema utilizza **clustering intelligente** per ridurre il dataset IMDB da 25.000 a 400 esempi rappresentativi (80 cluster × 5 campioni), mantenendo la diversità e il bilanciamento dei dati.
+
+Il framework è specificamente progettato per Google Colab con gestione avanzata della memoria GPU, caching intelligente e backup automatico su Google Drive.
+
+## Explainers Supportati
+
+| Metodo | Descrizione | Dipendenze |
+|--------|-------------|------------|
+| **LIME** | Local Interpretable Model-agnostic Explanations | lime |
+| **SHAP** | SHapley Additive exPlanations | shap |
+| **Gradient×Input** | Attribution basata su gradienti | - |
+| **Attention Rollout** | Analisi del flusso di attention | - |
+| **Attention Flow** | Analisi di attention basata su grafi | networkx |
+| **LRP** | Layer-wise Relevance Propagation | - |
+
+Le dipendenze mancanti vengono installate automaticamente durante l'esecuzione.
+
+## Metriche di Valutazione
+
+### Robustness
+Misura la stabilità delle spiegazioni sotto perturbazioni dell'input (masking, cancellazione, sostituzione).
+- **Range**: 0.0 - 1.0 (più basso = più robusto)
+- **Buon punteggio**: < 0.1
+
+### Consistency
+Misura la stabilità delle spiegazioni con diversi seed di inferenza (comportamento stocastico).
+- **Range**: 0.0 - 1.0 (più alto = più consistente)  
+- **Buon punteggio**: > 0.8
+
+### Contrastivity
+Misura quanto bene le spiegazioni discriminano tra sentiment positivi e negativi.
+- **Range**: 0.0 - ∞ (più alto = migliore discriminazione)
+- **Buon punteggio**: > 2.0
 
 ## Struttura del Progetto
 
 ```
-xai-benchmark/
-├── README.md                 # Documentazione progetto
-├── requirements.txt          # Dipendenze Python
-├── Train.csv                 # Dataset IMDB training
-├── Test.csv                  # Dataset IMDB test
-│
-├── main.py                   # CLI principale
-├── evaluate.py               # Valutazione modelli+explainer
-├── report.py                 # Generazione tabelle aggregate
-├── test_everything.py        # Test progressivi completi
-│
-├── models.py                 # Gestione modelli pre-trained
-├── dataset.py                # Caricamento dataset IMDB
-├── explainers.py             # 6 metodi XAI
-├── metrics.py                # 3 metriche di valutazione
-└── utils.py                  # Funzioni utility
+├── main.py           # Interfaccia principale e funzioni core
+├── report.py         # Generazione report completo
+├── models.py         # Gestione modelli pre-addestrati
+├── dataset.py        # Dataset IMDB con clustering
+├── explainers.py     # Implementazione metodi XAI
+├── metrics.py        # Metriche di valutazione
+├── utils.py          # Utility per Colab e ottimizzazioni
+├── requirements.txt  # Dipendenze Python
+└── Test.csv          # Dataset IMDB test (richiesto)
 ```
 
-## Modelli Supportati
+## Modelli Disponibili
 
-- **TinyBERT**: Versione distillata (~14.5M parametri, fine-tuned su IMDB)
-- **DistilBERT**: DistilBERT ottimizzato (~66M parametri, 91.3% accuracy su SST-2)
-- **RoBERTa-base**: Fine-tuned su Amazon Reviews (~125M parametri)
-- **BERT-large**: Fine-tuned su SST-2 (~340M parametri)
-- **RoBERTa-large**: Multi-dataset (~355M parametri)
+| Modello | Descrizione | Dimensione |
+|---------|-------------|------------|
+| `tinybert` | BERT leggero per IMDB | Piccolo |
+| `distilbert` | DistilBERT per SST-2 | Piccolo |
+| `roberta-base` | RoBERTa base per sentiment | Medio |
+| `bert-large` | BERT Large per SST-2 | Grande |
+| `roberta-large` | RoBERTa Large per sentiment | Grande |
 
-## Metodi XAI Implementati
+## Ottimizzazioni Implementate
 
-- **`grad_input`**: Gradient × Input a livello di embedding
-- **`lrp`**: Layer-wise Relevance Propagation
-- **`attention_rollout`**: Rollout dell'attenzione tra layer
-- **`lime`**: Local Interpretable Model-agnostic Explanations
-- **`shap`**: SHapley Additive exPlanations (Kernel)
+### Gestione Memoria Avanzata
+- **Adaptive Batch Sizing**: Dimensioni batch dinamiche basate su memoria disponibile
+- **GPU Memory Pool**: Pool di memoria pre-allocato per evitare frammentazione
+- **Progressive Cleanup**: Pulizia memoria automatica tra batch
+- **Memory Monitoring**: Monitoraggio continuo con alerting
 
-## Metriche di Valutazione
+### Caching Intelligente
+- **Embedding Cache**: Cache per embeddings e tokenizzazioni
+- **Checkpoint System**: Salvataggio automatico dei progressi
+- **Resume Capability**: Ripresa automatica da checkpoint esistenti
 
-Implementa **3 metriche automatiche** basate su Mersha et al. (2025):
+### Ottimizzazioni Dataset
+- **Clustering K-means**: 80 cluster con 5 campioni rappresentativi
+- **Stratified Sampling**: Mantenimento bilanciamento positivo/negativo
+- **Memory-Efficient Loading**: Caricamento ottimizzato per Colab
 
-### 1.  Robustness
+### I/O Asincrono
+- **Background Saving**: Salvataggio file in background
+- **Thread Pool I/O**: Operazioni I/O parallele
+- **Google Drive Backup**: Backup automatico risultati
 
-Cosa misura: Stabilità delle spiegazioni sotto perturbazioni del testo
-Metodo: Mean Average Difference (MAD) tra spiegazioni originali e perturbate
-Interpretazione: Più basso = più robusto
-Formula: Differenze element-wise tra attribution su testo originale e perturbato
+### Processamento Sequenziale
+- **Simplified Architecture**: Architettura semplificata senza parallelizzazione explainer
+- **Error Recovery**: Gestione errori robusta con fallback
+- **Resource Allocation**: Allocazione dinamica risorse
 
-### 2. Consistency
-
-Cosa misura: Accordo tra spiegazioni di modelli diversi sullo stesso testo
-Metodo: Correlazione di Spearman tra importanze di token comuni
-Interpretazione: Più alto = più consistente
-Note: Adattata per confrontare modelli diversi pre-addestrati (invece di modelli identici con seed diversi)
-
-### 3. Contrastivity
-
-Cosa misura: Diversità delle spiegazioni tra classi opposte (positivo vs negativo)
-Metodo: Divergenza KL tra distribuzioni di importanza per le due classi
-Interpretazione: Più alto = più contrastivo
-Utilità: Verifica che l'XAI evidenzi feature diverse per predizioni opposte
-
-## Installazione
+## Uso Rapido
 
 ```bash
-git clone https://github.com/username/xai-benchmark.git
-cd xai-benchmark
-pip install -r requirements.txt
+# Report completo veloce
+!python report.py --sample 100
 ```
 
-## Utilizzo
-
-### Test Sistema
-```bash
-python test_everything.py --level 5
-```
-
-### Spiegazione Singola
-```bash
-python main.py explain --model distilbert --explainer lime --text "This movie is amazing!"
-```
-
-### Valutazione Metrica
-```bash
-python main.py evaluate --metric robustness --model distilbert --explainer grad_input --sample 500
-```
-
-### Report Completo
-```bash
-python report.py --sample 50 --csv
-```
-
-## Configurazione
-
-Parametri principali in `dataset.py`, `metrics.py`, `evaluate.py`:
-- `MAX_LENGTH = 512` - Lunghezza massima sequenze
-- `DEFAULT_SAMPLE_SIZE = 500` - Esempi per valutazione
-- `DEFAULT_PERTURBATION_RATIO = 0.15` - Percentuale perturbazioni
+I risultati vengono salvati automaticamente in CSV e JSON con backup su Google Drive.
