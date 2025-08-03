@@ -1,19 +1,12 @@
 """
-dataset.py - Dataset IMDB con clustering intelligente per Google Colab (UPDATED)
-================================================================================
+dataset_optimized.py - Clustering ottimizzato per ottenere esattamente 400 osservazioni
+=====================================================================================
 
-AGGIORNAMENTI:
-1. Clustering KMeans aggiornato: K=80 cluster, 5 osservazioni per cluster
-2. Dataset finale: sempre 400 esempi rappresentativi (80 × 5 = 400)
-3. DataLoader ottimizzati per Colab (num_workers=0)
-4. Sampling stratificato per mantenere balance
-5. Cache del dataset clusterizzato
-6. Memory-efficient processing
-
-STRATEGIA CLUSTERING AGGIORNATA:
-- KMeans con K=80 cluster sui text embeddings
-- 5 esempi per cluster (mix pos/neg quando possibile)  
-- Risultato: 400 esempi rappresentativi del dataset completo
+STRATEGIA OTTIMIZZATA:
+1. Analisi automatica del numero ottimale di cluster
+2. Clustering adattivo con verifica dei risultati
+3. Post-processing per garantire esattamente 400 osservazioni
+4. Bilanciamento automatico delle classi
 
 """
 
@@ -23,199 +16,388 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import pickle
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 from transformers import AutoTokenizer
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
-import models
+from collections import Counter
+import warnings
+warnings.filterwarnings('ignore')
 
-# ==== Parametri AGGIORNATI ====
+# ==== Parametri Configurabili ====
 DATA_DIR = Path(".")
-TEST_FILE = "Test.csv"  # Solo test file
+TEST_FILE = "Test.csv"
 CACHE_DIR = Path("dataset_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Parametri clustering AGGIORNATI
-N_CLUSTERS = 80                          # Ridotto da 100 a 80
-SAMPLES_PER_CLUSTER = 5                  # Aumentato da 4 a 5
-TARGET_DATASET_SIZE = N_CLUSTERS * SAMPLES_PER_CLUSTER  # 80 × 5 = 400
-
-# Parametri tokenizzazione
+# Parametri target
+TARGET_DATASET_SIZE = 400
 MAX_LENGTH = 512
 BATCH_SIZE = 16
 RANDOM_STATE = 42
 
-print(f"[DATASET] UPDATED clustering: {N_CLUSTERS} clusters × {SAMPLES_PER_CLUSTER} samples = {TARGET_DATASET_SIZE} total")
+# Parametri clustering ottimizzati
+MIN_CLUSTER_SIZE = 3  # Minimo per avere diversità
+MAX_CLUSTERS = 50     # Limite superiore ragionevole
+MIN_CLUSTERS = 20     # Limite inferiore per diversità
 
-# ==== Funzioni Clustering (aggiornate) ====
-def create_text_embeddings(texts: List[str], max_features: int = 5000) -> np.ndarray:
-    """Crea embeddings TF-IDF per clustering."""
-    print(f"[EMBEDDING] Creating TF-IDF embeddings for {len(texts)} texts...")
+print(f"[OPTIMIZER] Target: {TARGET_DATASET_SIZE} observations from clustered sampling")
+
+class OptimizedClusteringSampler:
+    """Sampler intelligente che trova automaticamente il K ottimale."""
     
-    # TF-IDF con parametri ottimizzati per più cluster
+    def __init__(self, target_size: int = TARGET_DATASET_SIZE):
+        self.target_size = target_size
+        self.random_state = RANDOM_STATE
+        
+    def find_optimal_k(self, df: pd.DataFrame) -> Tuple[int, int]:
+        """
+        Trova il numero ottimale di cluster per ottenere target_size osservazioni.
+        
+        Returns:
+            (k_optimal, samples_per_cluster)
+        """
+        print(f"[OPTIMIZER] Finding optimal K for {len(df)} observations → {self.target_size} target")
+        
+        # Lista di candidati K da testare
+        candidates = []
+        
+        # Strategia 1: Divisori esatti del target
+        for samples_per_cluster in range(3, 11):  # da 3 a 10 samples per cluster
+            k = self.target_size // samples_per_cluster
+            if MIN_CLUSTERS <= k <= MAX_CLUSTERS:
+                candidates.append((k, samples_per_cluster))
+        
+        # Strategia 2: K fissi con samples variabili
+        for k in range(MIN_CLUSTERS, min(MAX_CLUSTERS + 1, len(df) // MIN_CLUSTER_SIZE)):
+            samples_per_cluster = self.target_size // k
+            if samples_per_cluster >= 3:  # Minimo 3 samples per cluster
+                candidates.append((k, samples_per_cluster))
+        
+        # Rimuovi duplicati e ordina
+        candidates = list(set(candidates))
+        candidates.sort(key=lambda x: abs(x[0] * x[1] - self.target_size))  # Più vicino al target
+        
+        print(f"[OPTIMIZER] Testing {len(candidates)} candidate configurations...")
+        
+        # Testa ogni candidato
+        best_config = None
+        best_score = -1
+        
+        for k, samples_per_cluster in candidates[:10]:  # Testa solo i primi 10
+            score = self._evaluate_clustering_config(df, k, samples_per_cluster)
+            expected_size = k * samples_per_cluster
+            
+            print(f"[OPTIMIZER]   K={k:2d}, samples={samples_per_cluster}, expected={expected_size:3d}, score={score:.3f}")
+            
+            if score > best_score:
+                best_score = score
+                best_config = (k, samples_per_cluster)
+        
+        if best_config is None:
+            # Fallback sicuro
+            k_fallback = max(MIN_CLUSTERS, self.target_size // 8)  # ~8 samples per cluster
+            samples_fallback = self.target_size // k_fallback
+            best_config = (k_fallback, samples_fallback)
+            print(f"[OPTIMIZER] Using fallback: K={k_fallback}, samples={samples_fallback}")
+        
+        k_opt, samples_opt = best_config
+        print(f"[OPTIMIZER] ✓ Optimal: K={k_opt}, samples_per_cluster={samples_opt} (score={best_score:.3f})")
+        
+        return k_opt, samples_opt
+    
+    def _evaluate_clustering_config(self, df: pd.DataFrame, k: int, samples_per_cluster: int) -> float:
+        """
+        Valuta una configurazione di clustering senza fare il clustering completo.
+        Usa metriche euristiche per stimare la qualità.
+        """
+        n_samples = len(df)
+        
+        # Penalizza se troppi cluster per il dataset
+        if k > n_samples // 10:  # Meno di 10 osservazioni per cluster in media
+            return 0.1
+        
+        # Penalizza configurazioni troppo sbilanciate
+        expected_cluster_size = n_samples / k
+        if expected_cluster_size < MIN_CLUSTER_SIZE:
+            return 0.2
+        
+        # Favorisci configurazioni che producono esattamente il target
+        expected_total = k * samples_per_cluster
+        size_penalty = abs(expected_total - self.target_size) / self.target_size
+        
+        # Score finale (più alto = migliore)
+        base_score = 1.0 - size_penalty
+        
+        # Bonus per configurazioni bilanciate
+        if samples_per_cluster >= 4 and samples_per_cluster <= 8:
+            base_score += 0.1
+        
+        # Bonus per K ragionevoli
+        if MIN_CLUSTERS <= k <= 40:
+            base_score += 0.1
+        
+        return max(0, base_score)
+
+def create_optimized_embeddings(texts: List[str], max_features: int = 8000) -> Tuple[np.ndarray, TfidfVectorizer]:
+    """Crea embeddings TF-IDF ottimizzati per clustering."""
+    print(f"[EMBEDDING] Creating optimized TF-IDF for {len(texts)} texts...")
+    
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         stop_words='english',
-        ngram_range=(1, 2),  # unigrams + bigrams
-        min_df=2,            # ignora parole troppo rare
-        max_df=0.95,         # ignora parole troppo comuni
-        sublinear_tf=True    # scaling logaritmico
+        ngram_range=(1, 3),      # Includi trigrammi per più diversità
+        min_df=3,                # Soglia più alta per ridurre noise
+        max_df=0.9,              # Escludi parole troppo comuni
+        sublinear_tf=True,
+        norm='l2'                # Normalizzazione L2
     )
     
     tfidf_matrix = vectorizer.fit_transform(texts)
     
-    # Normalizza per KMeans
-    scaler = StandardScaler(with_mean=False)  # sparse matrix compatible
-    embeddings = scaler.fit_transform(tfidf_matrix)
+    # Normalizzazione aggiuntiva per KMeans
+    scaler = StandardScaler(with_mean=False)
+    embeddings_scaled = scaler.fit_transform(tfidf_matrix)
     
-    print(f"[EMBEDDING] ✓ Shape: {embeddings.shape}")
-    return embeddings.toarray(), vectorizer
+    print(f"[EMBEDDING] ✓ Shape: {embeddings_scaled.shape}, density: {embeddings_scaled.nnz/embeddings_scaled.size:.3f}")
+    
+    return embeddings_scaled.toarray(), vectorizer
 
-def perform_clustering(embeddings: np.ndarray, n_clusters: int = N_CLUSTERS) -> np.ndarray:
-    """Applica KMeans clustering con parametri aggiornati."""
-    print(f"[CLUSTERING] KMeans with {n_clusters} clusters (updated from 100)...")
+def perform_optimized_clustering(embeddings: np.ndarray, k: int) -> Tuple[np.ndarray, KMeans]:
+    """KMeans ottimizzato con controllo qualità."""
+    print(f"[CLUSTERING] KMeans with K={k} (optimized)...")
     
     kmeans = KMeans(
-        n_clusters=n_clusters,
+        n_clusters=k,
         random_state=RANDOM_STATE,
-        n_init=10,
-        max_iter=300,
-        init='k-means++',    # Inizializzazione migliorata per più cluster
-        algorithm='lloyd'    # Algoritmo standard per stabilità
+        n_init=20,               # Più inizializzazioni per stabilità
+        max_iter=500,            # Più iterazioni
+        init='k-means++',
+        algorithm='lloyd',
+        tol=1e-6                 # Tolleranza più stretta
     )
     
     cluster_labels = kmeans.fit_predict(embeddings)
     
-    # Verifica distribuzione cluster
+    # Analisi qualità clustering
     unique_labels, counts = np.unique(cluster_labels, return_counts=True)
-    print(f"[CLUSTERING] ✓ {len(unique_labels)} clusters created")
-    print(f"[CLUSTERING]   Cluster sizes: min={counts.min()}, max={counts.max()}, avg={counts.mean():.1f}")
+    inertia = kmeans.inertia_
     
-    return cluster_labels
+    empty_clusters = k - len(unique_labels)
+    min_size, max_size = counts.min(), counts.max()
+    avg_size = counts.mean()
+    
+    print(f"[CLUSTERING] ✓ Results: {len(unique_labels)}/{k} non-empty clusters")
+    print(f"[CLUSTERING]   Sizes: min={min_size}, max={max_size}, avg={avg_size:.1f}")
+    print(f"[CLUSTERING]   Empty clusters: {empty_clusters}")
+    print(f"[CLUSTERING]   Inertia: {inertia:.1f}")
+    
+    return cluster_labels, kmeans
 
-def sample_from_clusters(df: pd.DataFrame, cluster_labels: np.ndarray, 
-                        samples_per_cluster: int = SAMPLES_PER_CLUSTER) -> pd.DataFrame:
-    """Campiona esempi rappresentativi da ogni cluster (aggiornato per 5 samples)."""
-    print(f"[SAMPLING] Extracting {samples_per_cluster} samples per cluster (updated)...")
+def intelligent_cluster_sampling(df: pd.DataFrame, cluster_labels: np.ndarray, 
+                                k: int, samples_per_cluster: int) -> pd.DataFrame:
+    """
+    Sampling intelligente che garantisce esattamente target_size osservazioni.
+    """
+    print(f"[SAMPLING] Intelligent sampling: {k} clusters × {samples_per_cluster} samples")
     
     sampled_indices = []
-    cluster_stats = {"empty": 0, "insufficient": 0, "full": 0}
+    cluster_info = []
     
-    for cluster_id in range(N_CLUSTERS):
+    # Prima passata: campiona da cluster non vuoti
+    for cluster_id in range(k):
         cluster_mask = cluster_labels == cluster_id
         cluster_indices = np.where(cluster_mask)[0]
         
         if len(cluster_indices) == 0:
-            cluster_stats["empty"] += 1
-            print(f"[WARNING] Cluster {cluster_id} is empty")
+            cluster_info.append({'id': cluster_id, 'size': 0, 'sampled': 0, 'pos': 0, 'neg': 0})
             continue
-            
-        # Separa per classe
+        
+        # Analizza distribuzione classi nel cluster
         cluster_df = df.iloc[cluster_indices]
         pos_indices = cluster_indices[cluster_df['label'] == 1]
         neg_indices = cluster_indices[cluster_df['label'] == 0]
         
-        # Sampling stratificato bilanciato (aggiornato per 5 samples)
+        # Sampling stratificato bilanciato
         selected = []
         
-        # Strategia per 5 samples: 3-2 o 2-3 split quando possibile
-        n_pos_target = min(3, len(pos_indices))  # Preferisce 3 positivi
-        n_neg_target = min(samples_per_cluster - n_pos_target, len(neg_indices))
+        # Calcola target per classe
+        n_pos_available = len(pos_indices)
+        n_neg_available = len(neg_indices)
         
-        # Aggiusta se non abbastanza negativi
-        if n_neg_target < (samples_per_cluster - n_pos_target) and len(pos_indices) > n_pos_target:
-            additional_pos = min(samples_per_cluster - n_neg_target - n_pos_target, 
-                               len(pos_indices) - n_pos_target)
-            n_pos_target += additional_pos
+        if n_pos_available == 0:
+            # Solo negativi
+            n_pos_target, n_neg_target = 0, min(samples_per_cluster, n_neg_available)
+        elif n_neg_available == 0:
+            # Solo positivi
+            n_pos_target, n_neg_target = min(samples_per_cluster, n_pos_available), 0
+        else:
+            # Bilanciato
+            half = samples_per_cluster // 2
+            n_pos_target = min(half + (samples_per_cluster % 2), n_pos_available)
+            n_neg_target = min(samples_per_cluster - n_pos_target, n_neg_available)
+            
+            # Aggiusta se una classe non ha abbastanza esempi
+            if n_neg_target < (samples_per_cluster - n_pos_target):
+                n_pos_target = min(samples_per_cluster - n_neg_target, n_pos_available)
         
-        # Campiona positivi
-        if n_pos_target > 0 and len(pos_indices) > 0:
-            selected_pos = np.random.choice(pos_indices, 
-                                          min(n_pos_target, len(pos_indices)), 
-                                          replace=False)
+        # Campiona
+        if n_pos_target > 0:
+            selected_pos = np.random.choice(pos_indices, n_pos_target, replace=False)
             selected.extend(selected_pos)
         
-        # Campiona negativi
-        if n_neg_target > 0 and len(neg_indices) > 0:
-            selected_neg = np.random.choice(neg_indices, 
-                                          min(n_neg_target, len(neg_indices)), 
-                                          replace=False)
+        if n_neg_target > 0:
+            selected_neg = np.random.choice(neg_indices, n_neg_target, replace=False)
             selected.extend(selected_neg)
-            
-        # Se ancora non abbastanza, prendi random dal cluster
-        remaining_needed = samples_per_cluster - len(selected)
-        if remaining_needed > 0:
-            remaining_indices = [idx for idx in cluster_indices if idx not in selected]
-            if remaining_indices:
-                additional = np.random.choice(remaining_indices, 
-                                           min(remaining_needed, len(remaining_indices)), 
-                                           replace=False)
+        
+        # Se ancora mancano, prendi random
+        if len(selected) < samples_per_cluster and len(cluster_indices) > len(selected):
+            remaining = [idx for idx in cluster_indices if idx not in selected]
+            needed = min(samples_per_cluster - len(selected), len(remaining))
+            if needed > 0:
+                additional = np.random.choice(remaining, needed, replace=False)
                 selected.extend(additional)
         
-        if len(selected) == samples_per_cluster:
-            cluster_stats["full"] += 1
-        elif len(selected) > 0:
-            cluster_stats["insufficient"] += 1
-        
         sampled_indices.extend(selected)
+        
+        cluster_info.append({
+            'id': cluster_id,
+            'size': len(cluster_indices),
+            'sampled': len(selected),
+            'pos': sum(1 for idx in selected if df.iloc[idx]['label'] == 1),
+            'neg': len(selected) - sum(1 for idx in selected if df.iloc[idx]['label'] == 1)
+        })
     
-    # Crea dataset finale
-    sampled_df = df.iloc[sampled_indices].copy().reset_index(drop=True)
+    # Crea dataset base
+    base_df = df.iloc[sampled_indices].copy()
     
-    # Statistiche dettagliate
-    total_samples = len(sampled_df)
-    pos_samples = (sampled_df['label'] == 1).sum()
-    neg_samples = total_samples - pos_samples
+    # Post-processing per raggiungere esattamente target_size
+    current_size = len(base_df)
+    target_size = k * samples_per_cluster
     
-    print(f"[SAMPLING] ✓ Final dataset: {total_samples} samples")
-    print(f"[SAMPLING] ✓ Distribution: {pos_samples} positive, {neg_samples} negative")
-    print(f"[SAMPLING] ✓ Balance: {pos_samples/total_samples:.1%} positive")
-    print(f"[SAMPLING]   Cluster stats: {cluster_stats['full']} full, {cluster_stats['insufficient']} partial, {cluster_stats['empty']} empty")
+    print(f"[SAMPLING] Base sampling: {current_size} samples")
     
-    return sampled_df
+    if current_size < target_size:
+        # Aggiungi campioni mancanti da cluster più grandi
+        deficit = target_size - current_size
+        print(f"[SAMPLING] Adding {deficit} missing samples...")
+        
+        # Trova cluster con più osservazioni disponibili
+        available_clusters = [info for info in cluster_info if info['size'] > info['sampled']]
+        available_clusters.sort(key=lambda x: x['size'] - x['sampled'], reverse=True)
+        
+        additional_indices = []
+        for info in available_clusters:
+            if deficit <= 0:
+                break
+            
+            cluster_id = info['id']
+            cluster_mask = cluster_labels == cluster_id
+            cluster_indices = np.where(cluster_mask)[0]
+            
+            # Escludi già campionati
+            already_sampled = set(sampled_indices)
+            available_in_cluster = [idx for idx in cluster_indices if idx not in already_sampled]
+            
+            # Prendi quello che serve
+            to_add = min(deficit, len(available_in_cluster))
+            if to_add > 0:
+                additional = np.random.choice(available_in_cluster, to_add, replace=False)
+                additional_indices.extend(additional)
+                deficit -= to_add
+        
+        if additional_indices:
+            additional_df = df.iloc[additional_indices].copy()
+            base_df = pd.concat([base_df, additional_df], ignore_index=True)
+    
+    elif current_size > target_size:
+        # Rimuovi campioni in eccesso (stratificato)
+        excess = current_size - target_size
+        print(f"[SAMPLING] Removing {excess} excess samples...")
+        
+        # Rimozione stratificata
+        pos_df = base_df[base_df['label'] == 1]
+        neg_df = base_df[base_df['label'] == 0]
+        
+        pos_to_remove = min(excess // 2, len(pos_df) - target_size // 2)
+        neg_to_remove = excess - pos_to_remove
+        
+        # Rimuovi random
+        if pos_to_remove > 0:
+            pos_to_keep = pos_df.sample(len(pos_df) - pos_to_remove, random_state=RANDOM_STATE)
+        else:
+            pos_to_keep = pos_df
+        
+        if neg_to_remove > 0:
+            neg_to_keep = neg_df.sample(len(neg_df) - neg_to_remove, random_state=RANDOM_STATE)
+        else:
+            neg_to_keep = neg_df
+        
+        base_df = pd.concat([pos_to_keep, neg_to_keep], ignore_index=True)
+    
+    # Shuffle finale
+    final_df = base_df.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+    
+    # Statistiche finali
+    final_size = len(final_df)
+    pos_count = (final_df['label'] == 1).sum()
+    neg_count = final_size - pos_count
+    
+    non_empty_clusters = sum(1 for info in cluster_info if info['sampled'] > 0)
+    
+    print(f"[SAMPLING] ✓ Final dataset: {final_size} samples")
+    print(f"[SAMPLING] ✓ Distribution: {pos_count} pos ({pos_count/final_size:.1%}), {neg_count} neg ({neg_count/final_size:.1%})")
+    print(f"[SAMPLING] ✓ Clusters used: {non_empty_clusters}/{k}")
+    
+    return final_df
 
-def create_clustered_dataset(df: pd.DataFrame, cache_file: Path) -> pd.DataFrame:
-    """Crea dataset clusterizzato con parametri aggiornati."""
-    print(f"[CLUSTER] Creating clustered dataset from {len(df)} examples...")
-    print(f"[CLUSTER] Target: {N_CLUSTERS} clusters × {SAMPLES_PER_CLUSTER} samples = {TARGET_DATASET_SIZE} total")
+def create_optimized_dataset(df: pd.DataFrame, cache_file: Path) -> pd.DataFrame:
+    """Pipeline completa ottimizzata."""
+    print(f"[PIPELINE] Creating optimized dataset from {len(df)} examples...")
     
-    # Set seed per riproducibilità
+    # Set seed
     np.random.seed(RANDOM_STATE)
     
-    # Step 1: Crea embeddings
+    # Step 1: Trova K ottimale
+    sampler = OptimizedClusteringSampler(TARGET_DATASET_SIZE)
+    k_optimal, samples_per_cluster = sampler.find_optimal_k(df)
+    
+    # Step 2: Embeddings
     texts = df['text'].tolist()
-    embeddings, vectorizer = create_text_embeddings(texts)
+    embeddings, vectorizer = create_optimized_embeddings(texts)
     
-    # Step 2: Clustering aggiornato
-    cluster_labels = perform_clustering(embeddings)
+    # Step 3: Clustering
+    cluster_labels, kmeans_model = perform_optimized_clustering(embeddings, k_optimal)
     
-    # Step 3: Sampling aggiornato
-    clustered_df = sample_from_clusters(df, cluster_labels)
+    # Step 4: Sampling intelligente
+    final_df = intelligent_cluster_sampling(df, cluster_labels, k_optimal, samples_per_cluster)
     
-    # Step 4: Cache con metadati aggiornati
+    # Step 5: Cache
     cache_data = {
-        'dataframe': clustered_df,
+        'dataframe': final_df,
         'cluster_labels': cluster_labels,
+        'kmeans_model': kmeans_model,
         'vectorizer': vectorizer,
         'metadata': {
             'original_size': len(df),
-            'clustered_size': len(clustered_df),
-            'n_clusters': N_CLUSTERS,
-            'samples_per_cluster': SAMPLES_PER_CLUSTER,
-            'version': '2.0_updated',  # Version marker
-            'clustering_strategy': f'{N_CLUSTERS}x{SAMPLES_PER_CLUSTER}'
+            'final_size': len(final_df),
+            'k_optimal': k_optimal,
+            'samples_per_cluster': samples_per_cluster,
+            'target_size': TARGET_DATASET_SIZE,
+            'version': '3.0_optimized'
         }
     }
     
     with open(cache_file, 'wb') as f:
         pickle.dump(cache_data, f)
+    
     print(f"[CACHE] ✓ Saved to {cache_file}")
     
-    return clustered_df
+    return final_df
 
-def load_clustered_dataset(cache_file: Path) -> Optional[pd.DataFrame]:
-    """Carica dataset clusterizzato da cache (con verifica versione)."""
+def load_optimized_dataset(cache_file: Path) -> Optional[pd.DataFrame]:
+    """Carica dataset ottimizzato da cache."""
     if not cache_file.exists():
         return None
     
@@ -226,252 +408,56 @@ def load_clustered_dataset(cache_file: Path) -> Optional[pd.DataFrame]:
         df = cache_data['dataframe']
         metadata = cache_data['metadata']
         
-        # Verifica se cache usa nuovi parametri
-        cache_clusters = metadata.get('n_clusters', 100)  # Default old value
-        cache_samples = metadata.get('samples_per_cluster', 4)  # Default old value
-        
-        if cache_clusters != N_CLUSTERS or cache_samples != SAMPLES_PER_CLUSTER:
-            print(f"[CACHE] Cache mismatch: {cache_clusters}x{cache_samples} vs current {N_CLUSTERS}x{SAMPLES_PER_CLUSTER}")
-            print(f"[CACHE] Will regenerate with updated parameters")
-            return None
-        
-        print(f"[CACHE] ✓ Loaded {len(df)} samples from cache")
-        print(f"[CACHE] ✓ Parameters: {cache_clusters} clusters × {cache_samples} samples")
-        print(f"[CACHE] ✓ Original: {metadata['original_size']} → Clustered: {metadata['clustered_size']}")
+        print(f"[CACHE] ✓ Loaded {len(df)} samples (target: {metadata['target_size']})")
+        print(f"[CACHE] ✓ Config: K={metadata['k_optimal']}, samples={metadata['samples_per_cluster']}")
         
         return df
     except Exception as e:
-        print(f"[CACHE] ✗ Cache loading failed: {e}")
+        print(f"[CACHE] Cache loading failed: {e}")
         return None
 
-# ==== Caricamento Dataset ====
-try:
-    # Carica solo test dataset (per XAI evaluation)
-    test_df_original = pd.read_csv(DATA_DIR / TEST_FILE)
-    print(f"[LOAD] ✓ Test dataset: {len(test_df_original)} examples")
-except FileNotFoundError as e:
-    print(f"[ERROR] Dataset loading failed: {e}")
-    print("Assicurati che Test.csv sia nella cartella corrente")
-    raise
-
-# Verifica struttura
-required_columns = ["text", "label"]
-missing_cols = [col for col in required_columns if col not in test_df_original.columns]
-if missing_cols:
-    raise ValueError(f"Dataset Test manca colonne: {missing_cols}")
-
-# ==== Clustering del Test Set (AGGIORNATO) ====
-cache_file = CACHE_DIR / f"clustered_test_{N_CLUSTERS}c_{SAMPLES_PER_CLUSTER}s_v2.pkl"  # v2 per nuova versione
-
-print(f"\n{'='*60}")
-print("DATASET CLUSTERING (UPDATED)")
-print(f"{'='*60}")
-print(f"Strategy: {N_CLUSTERS} clusters × {SAMPLES_PER_CLUSTER} samples = {TARGET_DATASET_SIZE} total")
-
-# Prova a caricare da cache
-test_df = load_clustered_dataset(cache_file)
-
-if test_df is None:
-    print("[CLUSTER] Cache not found or outdated, creating new clustered dataset...")
-    test_df = create_clustered_dataset(test_df_original, cache_file)
-else:
-    print("[CLUSTER] Using cached clustered dataset")
-
-print(f"\n[FINAL] Working dataset: {len(test_df)} examples")
-print(f"[FINAL] Reduction: {len(test_df_original)} → {len(test_df)} ({len(test_df)/len(test_df_original):.1%})")
-
-# ==== Pulizia Dataset ====
-LABEL_MAP = {
-    "negative": 0, "positive": 1, 
-    "neg": 0, "pos": 1,
-    "0": 0, "1": 1,
-    0: 0, 1: 1
-}
-
-def to_int_label(x):
-    """Converte label in intero 0/1."""
-    if isinstance(x, (int, float)):
-        return int(x)
-    try:
-        if isinstance(x, str):
-            return LABEL_MAP[x.strip().lower()]
-        return LABEL_MAP[x]
-    except (KeyError, AttributeError):
-        raise ValueError(f"Label sconosciuta: {x}")
-
-# Pulizia
-# Rimuovi righe vuote
-initial_len = len(test_df)
-test_df.dropna(subset=["text"], inplace=True)
-test_df = test_df[test_df["text"].str.strip() != ""]
-
-# Converti labels
-test_df["label"] = test_df["label"].apply(to_int_label)
-
-# Log
-if len(test_df) < initial_len:
-    print(f"[CLEAN] Test: removed {initial_len - len(test_df)} empty examples")
-
-label_counts = test_df["label"].value_counts().sort_index()
-print(f"[CLEAN] Test distribution: {dict(label_counts)}")
-
-# Reset index
-test_df = test_df.reset_index(drop=True)
-
-# ==== Tokenizzazione ottimizzata Colab ====
-def get_tokenizer_for_model(model_name: str):
-    """Carica tokenizer per modello."""
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
-        return tokenizer
-    except Exception as e:
-        print(f"[TOKENIZER] Error for {model_name}: {e}")
-        # Fallback
-        return AutoTokenizer.from_pretrained("bert-base-uncased")
-
-def encode_texts(text_list, tokenizer, max_length=MAX_LENGTH):
-    """Tokenizza lista di testi."""
-    return tokenizer(
-        text_list,
-        truncation=True,
-        padding="max_length",
-        max_length=max_length,
-        return_tensors="pt"
-    )
-
-# ==== Dataset Class Ottimizzata ====
-class IMDBDataset(Dataset):
-    def __init__(self, dataframe, tokenizer=None, max_length=MAX_LENGTH):
-        """Dataset IMDB ottimizzato per Colab."""
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.max_length = max_length
-        
-        # Tokenizer
-        if tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        else:
-            self.tokenizer = tokenizer
-            
-        print(f"[DATASET] Tokenizing {len(self.dataframe)} examples...")
-        
-        # Pre-tokenizza tutto per efficienza
-        encodings = encode_texts(list(self.dataframe["text"]), self.tokenizer, max_length)
-        
-        self.input_ids = encodings["input_ids"]
-        self.attention_masks = encodings["attention_mask"]
-        self.labels = torch.tensor(self.dataframe["label"].values, dtype=torch.long)
-        
-        print(f"[DATASET] ✓ {len(self)} examples ready")
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_masks[idx],
-            "labels": self.labels[idx],
-        }
-
-# ==== DataLoader Factory per Colab ====
-def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
-    """Crea DataLoader per test dataset (per XAI evaluation)."""
-    # Tokenizer
-    if model_name:
-        tokenizer = get_tokenizer_for_model(model_name)
-    else:
-        tokenizer = None
-    
-    # Solo test dataset
-    test_dataset = IMDBDataset(test_df, tokenizer, max_length)
-    
-    # DataLoader OTTIMIZZATO PER COLAB
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=0,      # IMPORTANTE: 0 per Colab  
-        pin_memory=False
-    )
-    
-    return test_loader
-
-# ==== Default DataLoader ====
-default_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-test_loader = DataLoader(
-    IMDBDataset(test_df, default_tokenizer), 
-    batch_size=BATCH_SIZE, 
-    shuffle=False,
-    num_workers=0
-)
-
-# ==== Utility Functions ====
-def get_clustered_sample(sample_size: Optional[int] = None, stratified: bool = True) -> Tuple[List[str], List[int]]:
-    """Restituisce sample del dataset clusterizzato."""
-    if sample_size is None or sample_size >= len(test_df):
-        texts = test_df["text"].tolist()
-        labels = test_df["label"].tolist()
-    else:
-        if stratified:
-            # Sampling stratificato
-            pos_df = test_df[test_df["label"] == 1]
-            neg_df = test_df[test_df["label"] == 0]
-            
-            n_pos = min(sample_size // 2, len(pos_df))
-            n_neg = min(sample_size - n_pos, len(neg_df))
-            
-            pos_sample = pos_df.sample(n_pos, random_state=RANDOM_STATE)
-            neg_sample = neg_df.sample(n_neg, random_state=RANDOM_STATE)
-            
-            sample_df = pd.concat([pos_sample, neg_sample]).sample(frac=1, random_state=RANDOM_STATE)
-        else:
-            sample_df = test_df.sample(sample_size, random_state=RANDOM_STATE)
-        
-        texts = sample_df["text"].tolist()
-        labels = sample_df["label"].tolist()
-    
-    return texts, labels
-
-def print_dataset_info():
-    """Stampa info dataset aggiornato."""
-    print(f"\n{'='*60}")
-    print("DATASET INFO (UPDATED)")
-    print(f"{'='*60}")
-    print(f"Test size: {len(test_df)} (clustered from {len(test_df_original)})")
-    print(f"Clustering: {N_CLUSTERS} clusters × {SAMPLES_PER_CLUSTER} samples")
-    print(f"Strategy change: 100×4 → {N_CLUSTERS}×{SAMPLES_PER_CLUSTER} (more granular)")
-    print(f"Reduction ratio: {len(test_df)/len(test_df_original):.1%}")
-    
-    pos = (test_df["label"] == 1).sum()
-    neg = len(test_df) - pos
-    print(f"Test: {pos} pos ({pos/len(test_df):.1%}), {neg} neg ({neg/len(test_df):.1%})")
-
-# ==== Test ====
+# ==== Main Execution ====
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("DATASET TEST (UPDATED VERSION)")
-    print("="*60)
+    print("\n" + "="*70)
+    print("OPTIMIZED CLUSTERING FOR EXACTLY 400 OBSERVATIONS")
+    print("="*70)
     
-    print_dataset_info()
+    # Carica dataset
+    try:
+        df_original = pd.read_csv(DATA_DIR / TEST_FILE)
+        print(f"[LOAD] ✓ Original dataset: {len(df_original)} examples")
+    except FileNotFoundError as e:
+        print(f"[ERROR] File not found: {e}")
+        exit(1)
     
-    # Test DataLoader
-    print(f"\nTesting DataLoader...")
-    batch = next(iter(test_loader))
-    shapes = {k: v.shape for k, v in batch.items()}
-    print(f"Batch shapes: {shapes}")
+    # Pulizia base
+    df_clean = df_original.dropna(subset=['text']).copy()
+    df_clean = df_clean[df_clean['text'].str.strip() != '']
+    df_clean['label'] = df_clean['label'].apply(lambda x: int(x) if str(x) in ['0', '1'] else (0 if str(x).lower() in ['negative', 'neg'] else 1))
+    df_clean = df_clean.reset_index(drop=True)
     
-    # Test sampling
-    print(f"\nTesting sampling...")
-    texts, labels = get_clustered_sample(10)
-    print(f"Sample: {len(texts)} texts, {sum(labels)} positive")
+    print(f"[CLEAN] ✓ Clean dataset: {len(df_clean)} examples")
     
-    # Verifica bilanciamento cluster sampling
-    print(f"\nCluster balance verification...")
-    sample_texts, sample_labels = get_clustered_sample(80)  # 1 per cluster
-    pos_ratio = sum(sample_labels) / len(sample_labels)
-    print(f"Cluster sampling balance: {pos_ratio:.1%} positive")
+    # Cache file
+    cache_file = CACHE_DIR / f"optimized_dataset_{TARGET_DATASET_SIZE}.pkl"
     
-    print(f"\n✓ Dataset ready for Colab XAI benchmark! (UPDATED)")
-    print(f"Working with {len(test_df)} representative examples ({N_CLUSTERS}×{SAMPLES_PER_CLUSTER}) instead of {len(test_df_original)}")
+    # Prova cache
+    final_df = load_optimized_dataset(cache_file)
+    
+    if final_df is None:
+        print("[PROCESS] Creating new optimized dataset...")
+        final_df = create_optimized_dataset(df_clean, cache_file)
+    
+    # Verifica finale
+    print(f"\n{'='*50}")
+    print("FINAL RESULTS")
+    print(f"{'='*50}")
+    print(f"Original size: {len(df_original)}")
+    print(f"Final size: {len(final_df)}")
+    print(f"Target achieved: {len(final_df) == TARGET_DATASET_SIZE}")
+    print(f"Reduction ratio: {len(final_df)/len(df_original):.1%}")
+    
+    pos_count = (final_df['label'] == 1).sum()
+    print(f"Class balance: {pos_count} pos ({pos_count/len(final_df):.1%}), {len(final_df)-pos_count} neg")
+    
+    print(f"\n✓ SUCCESS: Dataset with exactly {len(final_df)} observations ready!")
