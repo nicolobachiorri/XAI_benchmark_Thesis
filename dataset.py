@@ -103,7 +103,7 @@ class OptimizedClusteringSampler:
             print(f"[OPTIMIZER] Using fallback: K={k_fallback}, samples={samples_fallback}")
         
         k_opt, samples_opt = best_config
-        print(f"[OPTIMIZER] ✓ Optimal: K={k_opt}, samples_per_cluster={samples_opt} (score={best_score:.3f})")
+        print(f"[OPTIMIZER] Optimal: K={k_opt}, samples_per_cluster={samples_opt} (score={best_score:.3f})")
         
         return k_opt, samples_opt
     
@@ -160,7 +160,7 @@ def create_optimized_embeddings(texts: List[str], max_features: int = 8000) -> T
     scaler = StandardScaler(with_mean=False)
     embeddings_scaled = scaler.fit_transform(tfidf_matrix)
     
-    print(f"[EMBEDDING] ✓ Shape: {embeddings_scaled.shape}, density: {embeddings_scaled.nnz/embeddings_scaled.size:.3f}")
+    print(f"[EMBEDDING] Shape: {embeddings_scaled.shape}, density: {embeddings_scaled.nnz/embeddings_scaled.size:.3f}")
     
     return embeddings_scaled.toarray(), vectorizer
 
@@ -188,7 +188,7 @@ def perform_optimized_clustering(embeddings: np.ndarray, k: int) -> Tuple[np.nda
     min_size, max_size = counts.min(), counts.max()
     avg_size = counts.mean()
     
-    print(f"[CLUSTERING] ✓ Results: {len(unique_labels)}/{k} non-empty clusters")
+    print(f"[CLUSTERING] Results: {len(unique_labels)}/{k} non-empty clusters")
     print(f"[CLUSTERING]   Sizes: min={min_size}, max={max_size}, avg={avg_size:.1f}")
     print(f"[CLUSTERING]   Empty clusters: {empty_clusters}")
     print(f"[CLUSTERING]   Inertia: {inertia:.1f}")
@@ -346,9 +346,9 @@ def intelligent_cluster_sampling(df: pd.DataFrame, cluster_labels: np.ndarray,
     
     non_empty_clusters = sum(1 for info in cluster_info if info['sampled'] > 0)
     
-    print(f"[SAMPLING] ✓ Final dataset: {final_size} samples")
-    print(f"[SAMPLING] ✓ Distribution: {pos_count} pos ({pos_count/final_size:.1%}), {neg_count} neg ({neg_count/final_size:.1%})")
-    print(f"[SAMPLING] ✓ Clusters used: {non_empty_clusters}/{k}")
+    print(f"[SAMPLING] Final dataset: {final_size} samples")
+    print(f"[SAMPLING] Distribution: {pos_count} pos ({pos_count/final_size:.1%}), {neg_count} neg ({neg_count/final_size:.1%})")
+    print(f"[SAMPLING] Clusters used: {non_empty_clusters}/{k}")
     
     return final_df
 
@@ -392,7 +392,7 @@ def create_optimized_dataset(df: pd.DataFrame, cache_file: Path) -> pd.DataFrame
     with open(cache_file, 'wb') as f:
         pickle.dump(cache_data, f)
     
-    print(f"[CACHE] ✓ Saved to {cache_file}")
+    print(f"[CACHE] Saved to {cache_file}")
     
     return final_df
 
@@ -408,37 +408,17 @@ def load_optimized_dataset(cache_file: Path) -> Optional[pd.DataFrame]:
         df = cache_data['dataframe']
         metadata = cache_data['metadata']
         
-        print(f"[CACHE] ✓ Loaded {len(df)} samples (target: {metadata['target_size']})")
-        print(f"[CACHE] ✓ Config: K={metadata['k_optimal']}, samples={metadata['samples_per_cluster']}")
+        print(f"[CACHE] Loaded {len(df)} samples (target: {metadata['target_size']})")
+        print(f"[CACHE] Config: K={metadata['k_optimal']}, samples={metadata['samples_per_cluster']}")
         
         return df
     except Exception as e:
         print(f"[CACHE] Cache loading failed: {e}")
         return None
 
-# ==== Main Execution ====
-if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("OPTIMIZED CLUSTERING FOR EXACTLY 400 OBSERVATIONS")
-    print("="*70)
-    
-    # Carica dataset
-    try:
-        df_original = pd.read_csv(DATA_DIR / TEST_FILE)
-        print(f"[LOAD] ✓ Original dataset: {len(df_original)} examples")
-    except FileNotFoundError as e:
-        print(f"[ERROR] File not found: {e}")
-        exit(1)
-    
-    # Pulizia base
-    df_clean = df_original.dropna(subset=['text']).copy()
-    df_clean = df_clean[df_clean['text'].str.strip() != '']
-    df_clean['label'] = df_clean['label'].apply(lambda x: int(x) if str(x) in ['0', '1'] else (0 if str(x).lower() in ['negative', 'neg'] else 1))
-    df_clean = df_clean.reset_index(drop=True)
-    
-    print(f"[CLEAN] ✓ Clean dataset: {len(df_clean)} examples")
-    
-    # Cache file
+# ==== Caricamento Automatico Dataset per Integrazione ====
+def initialize_dataset():
+    """Inizializza dataset ottimizzato automaticamente."""
     cache_file = CACHE_DIR / f"optimized_dataset_{TARGET_DATASET_SIZE}.pkl"
     
     # Prova cache
@@ -446,18 +426,149 @@ if __name__ == "__main__":
     
     if final_df is None:
         print("[PROCESS] Creating new optimized dataset...")
-        final_df = create_optimized_dataset(df_clean, cache_file)
+        try:
+            df_original = pd.read_csv(DATA_DIR / TEST_FILE)
+            df_clean = df_original.dropna(subset=['text']).copy()
+            df_clean = df_clean[df_clean['text'].str.strip() != '']
+            df_clean['label'] = df_clean['label'].apply(lambda x: int(x) if str(x) in ['0', '1'] else (0 if str(x).lower() in ['negative', 'neg'] else 1))
+            df_clean = df_clean.reset_index(drop=True)
+            
+            final_df = create_optimized_dataset(df_clean, cache_file)
+        except FileNotFoundError as e:
+            print(f"[ERROR] File not found: {e}")
+            raise
     
-    # Verifica finale
-    print(f"\n{'='*50}")
-    print("FINAL RESULTS")
-    print(f"{'='*50}")
-    print(f"Original size: {len(df_original)}")
-    print(f"Final size: {len(final_df)}")
-    print(f"Target achieved: {len(final_df) == TARGET_DATASET_SIZE}")
-    print(f"Reduction ratio: {len(final_df)/len(df_original):.1%}")
+    return final_df
+
+# Inizializza dataset automaticamente all'import
+test_df = initialize_dataset()
+
+# ==== Compatibility Functions ====
+def get_clustered_sample(sample_size: Optional[int] = None, stratified: bool = True) -> Tuple[List[str], List[int]]:
+    """Restituisce sample del dataset clusterizzato (compatibilità)."""
+    if sample_size is None or sample_size >= len(test_df):
+        texts = test_df["text"].tolist()
+        labels = test_df["label"].tolist()
+    else:
+        if stratified:
+            # Sampling stratificato
+            pos_df = test_df[test_df["label"] == 1]
+            neg_df = test_df[test_df["label"] == 0]
+            
+            n_pos = min(sample_size // 2, len(pos_df))
+            n_neg = min(sample_size - n_pos, len(neg_df))
+            
+            pos_sample = pos_df.sample(n_pos, random_state=RANDOM_STATE)
+            neg_sample = neg_df.sample(n_neg, random_state=RANDOM_STATE)
+            
+            sample_df = pd.concat([pos_sample, neg_sample]).sample(frac=1, random_state=RANDOM_STATE)
+        else:
+            sample_df = test_df.sample(sample_size, random_state=RANDOM_STATE)
+        
+        texts = sample_df["text"].tolist()
+        labels = sample_df["label"].tolist()
     
-    pos_count = (final_df['label'] == 1).sum()
-    print(f"Class balance: {pos_count} pos ({pos_count/len(final_df):.1%}), {len(final_df)-pos_count} neg")
+    return texts, labels
+
+def print_dataset_info():
+    """Stampa info dataset ottimizzato (compatibilità)."""
+    print(f"\n{'='*60}")
+    print("OPTIMIZED DATASET INFO")
+    print(f"{'='*60}")
+    print(f"Dataset size: {len(test_df)} (optimized from clustering)")
+    print(f"Target achieved: {len(test_df) == TARGET_DATASET_SIZE}")
     
-    print(f"\n✓ SUCCESS: Dataset with exactly {len(final_df)} observations ready!")
+    pos = (test_df["label"] == 1).sum()
+    neg = len(test_df) - pos
+    print(f"Distribution: {pos} pos ({pos/len(test_df):.1%}), {neg} neg ({neg/len(test_df):.1%})")
+    print(f"Clustering strategy: Adaptive K-means with intelligent sampling")
+
+# ==== Dataset Class ====
+class IMDBDataset(Dataset):
+    def __init__(self, dataframe, tokenizer=None, max_length=MAX_LENGTH):
+        """Dataset IMDB ottimizzato."""
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.max_length = max_length
+        
+        # Tokenizer
+        if tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        else:
+            self.tokenizer = tokenizer
+            
+        # Pre-tokenizza
+        encodings = self.tokenizer(
+            list(self.dataframe["text"]),
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+            return_tensors="pt"
+        )
+        
+        self.input_ids = encodings["input_ids"]
+        self.attention_masks = encodings["attention_mask"]
+        self.labels = torch.tensor(self.dataframe["label"].values, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_masks[idx],
+            "labels": self.labels[idx],
+        }
+
+# ==== DataLoader Factory ====
+def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
+    """Crea DataLoader per dataset ottimizzato (compatibilità)."""
+    if model_name:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
+    
+    dataset = IMDBDataset(test_df, tokenizer, max_length)
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=0
+    )
+    
+    return dataloader
+
+# Default DataLoader per compatibilità
+default_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+if default_tokenizer.pad_token is None:
+    default_tokenizer.pad_token = "[PAD]"
+
+test_loader = DataLoader(
+    IMDBDataset(test_df, default_tokenizer), 
+    batch_size=BATCH_SIZE, 
+    shuffle=False,
+    num_workers=0
+)
+
+print(f"[DATASET] Ready: {len(test_df)} optimized examples, DataLoader created")
+
+# ==== Main Execution (per test standalone) ====
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("OPTIMIZED DATASET - STANDALONE TEST")
+    print("="*70)
+    
+    print_dataset_info()
+    
+    # Test sample
+    texts, labels = get_clustered_sample(10)
+    print(f"\nSample test: {len(texts)} texts, {sum(labels)} positive")
+    
+    # Test DataLoader
+    batch = next(iter(test_loader))
+    print(f"DataLoader test: {batch['input_ids'].shape}")
+    
+    print(f"\nAll tests passed! Dataset ready for XAI experiments.")
