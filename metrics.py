@@ -13,6 +13,7 @@ Metriche implementate:
 - Robustness: stabilità sotto perturbazioni
 - Consistency: stabilità con inference seed diversi  
 - Contrastivity: diversità tra classi opposte
+- Human Reasoning: accordo con ranking human-like (integrato)
 """
 
 import random
@@ -421,6 +422,115 @@ def compute_contrastivity(
     except Exception:
         return 0.0
 
+# ==== 4. HUMAN REASONING AGREEMENT (INTEGRATO) ====
+def compute_human_reasoning_score(xai_tokens: List[str], xai_scores: List[float], 
+                                hr_ranking: List[str]) -> float:
+    """
+    Calcola Human Reasoning Agreement usando Mean Average Precision (MAP)
+    
+    Args:
+        xai_tokens: Lista token dall'explainer
+        xai_scores: Lista score corrispondenti  
+        hr_ranking: Lista parole ordinate da LLM (più importante → meno importante)
+    
+    Returns:
+        float: Average Precision score (0-1, higher is better)
+    """
+    if not hr_ranking or not xai_tokens or not xai_scores:
+        return 0.0
+    
+    # Ordina XAI tokens per score (decrescente)
+    xai_ranking = [token.lower() for token, score in 
+                  sorted(zip(xai_tokens, xai_scores), key=lambda x: x[1], reverse=True)]
+    
+    # Normalizza HR ranking
+    hr_set = set(word.lower() for word in hr_ranking)
+    
+    # Calcola Average Precision
+    relevant_count = 0
+    precision_sum = 0
+    
+    for k, xai_word in enumerate(xai_ranking, 1):
+        if xai_word in hr_set:  # rel(k) = 1
+            relevant_count += 1
+            precision_at_k = relevant_count / k
+            precision_sum += precision_at_k
+    
+    # AP = sum(P(k) * rel(k)) / number_of_relevant_documents
+    ap = precision_sum / len(hr_ranking) if hr_ranking else 0.0
+    return ap
+
+def evaluate_human_reasoning_over_dataset(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    hr_dataset,  # Pre-loaded dataset
+    show_progress: bool = True
+) -> float:
+    """
+    Valuta Human Reasoning Agreement su dataset pre-caricato
+    
+    Args:
+        model: Modello PyTorch
+        tokenizer: Tokenizer del modello
+        explainer: Funzione explainer
+        hr_dataset: Ground truth dataset (deve essere già caricato)
+        show_progress: Mostra progress bar
+    
+    Returns:
+        float: Mean Average Precision across dataset (0-1, higher is better)
+    """
+    if hr_dataset is None:
+        print("[HR] No Human Reasoning dataset provided")
+        return 0.0
+    
+    # Filtra solo esempi con HR valido
+    valid_dataset = hr_dataset[hr_dataset['hr_count'] > 0].copy()
+    
+    if len(valid_dataset) == 0:
+        print("[HR] No valid HR examples found")
+        return 0.0
+    
+    hr_scores = []
+    failed_explanations = 0
+    
+    iterator = tqdm(valid_dataset.iterrows(), total=len(valid_dataset), 
+                   desc="HR Evaluation", leave=False) if show_progress else valid_dataset.iterrows()
+    
+    for idx, row in iterator:
+        try:
+            text = row['text']
+            hr_ranking = row['hr_ranking']
+            
+            # Genera XAI explanation
+            attr = explainer(text)
+            
+            # Verifica validità explanation
+            if not attr.tokens or not attr.scores:
+                failed_explanations += 1
+                continue
+            
+            # Calcola HR score
+            hr_score = compute_human_reasoning_score(
+                attr.tokens, attr.scores, hr_ranking
+            )
+            hr_scores.append(hr_score)
+            
+        except Exception as e:
+            print(f"[HR] Error processing example {idx}: {e}")
+            failed_explanations += 1
+            continue
+    
+    # Calcola MAP finale
+    mean_ap = float(np.mean(hr_scores)) if hr_scores else 0.0
+    
+    if show_progress:
+        print(f"[HR] Processed: {len(hr_scores)}/{len(valid_dataset)} examples")
+        print(f"[HR] Failed explanations: {failed_explanations}")
+        print(f"[HR] Mean Average Precision: {mean_ap:.4f}")
+    
+    return mean_ap
+
 # ==== Batch Processing Utilities ====
 def process_attributions_batch(
     texts: List[str], 
@@ -456,6 +566,7 @@ def print_metric_summary(
     robustness_score: float,
     consistency_score: float,
     contrastivity_score: float,
+    human_reasoning_score: Optional[float] = None,
 ):
     """Stampa summary metriche."""
     print("\n" + "="*50)
@@ -464,6 +575,8 @@ def print_metric_summary(
     print(f"Robustness:    {robustness_score:.4f} (lower = more robust)")
     print(f"Consistency:   {consistency_score:.4f} (higher = more consistent)")
     print(f"Contrastivity: {contrastivity_score:.4f} (higher = more contrastive)")
+    if human_reasoning_score is not None:
+        print(f"Human Reasoning: {human_reasoning_score:.4f} (higher = more human-like)")
     print("="*50)
 
 # ==== Test Function ====
@@ -506,7 +619,15 @@ if __name__ == "__main__":
         contrastivity = compute_contrastivity(pos_attrs, neg_attrs)
         print(f"Contrastivity: {contrastivity:.4f}")
         
-        print_metric_summary(robustness, consistency, contrastivity)
+        print("\nTesting Human Reasoning...")
+        # Mock HR data
+        hr_ranking = ["great", "movie", "fantastic"]
+        hr_score = compute_human_reasoning_score(
+            ["movie", "great", "is"], [0.8, 0.9, 0.3], hr_ranking
+        )
+        print(f"Human Reasoning: {hr_score:.4f}")
+        
+        print_metric_summary(robustness, consistency, contrastivity, hr_score)
         
         print("\n✓ Metrics test completed!")
         
