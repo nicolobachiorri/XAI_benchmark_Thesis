@@ -32,10 +32,10 @@ def auto_install_package(package_name: str, import_name: str = None):
             import subprocess
             import sys
             subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
-            print(f"[INSTALL] ✓ {package_name} installed")
+            print(f"[INSTALL]  {package_name} installed")
             return True
         except Exception as e:
-            print(f"[INSTALL] ✗ Failed to install {package_name}: {e}")
+            print(f"[INSTALL]  Failed to install {package_name}: {e}")
             return False
 
 # ==== Dependencies Check con Auto-install ====
@@ -46,30 +46,30 @@ try:
     auto_install_package("lime")
     from lime.lime_text import LimeTextExplainer
     LIME_AVAILABLE = True
-    print("[DEPS] ✓ LIME available")
+    print("[DEPS]  LIME available")
 except Exception:
     LIME_AVAILABLE = False
-    print("[DEPS] ✗ LIME not available")
+    print("[DEPS]  LIME not available")
 
 # SHAP
 try:
     auto_install_package("shap")
     import shap
     SHAP_AVAILABLE = True
-    print("[DEPS] ✓ SHAP available")
+    print("[DEPS]  SHAP available")
 except Exception:
     SHAP_AVAILABLE = False
-    print("[DEPS] ✗ SHAP not available")
+    print("[DEPS]  SHAP not available")
 
 # NetworkX
 try:
     auto_install_package("networkx")
     import networkx as nx
     NETWORKX_AVAILABLE = True
-    print("[DEPS] ✓ NetworkX available")
+    print("[DEPS]  NetworkX available")
 except Exception:
     NETWORKX_AVAILABLE = False
-    print("[DEPS] ✗ NetworkX not available")
+    print("[DEPS]  NetworkX not available")
 
 # ==== Constants ====
 MAX_LEN = 512
@@ -595,7 +595,7 @@ if __name__ == "__main__":
     # Check dependencies
     deps = check_dependencies()
     for lib, status in deps.items():
-        print(f"  {lib}: {'✓' if status else '✗'}")
+        print(f"  {lib}: {'' if status else ''}")
     
     available = list_explainers()
     print(f"Available explainers: {available}")
@@ -617,9 +617,9 @@ if __name__ == "__main__":
                     print(f"  Result: {len(result.tokens)} tokens, {len(result.scores)} scores")
                     if result.tokens and result.scores:
                         print(f"  Sample: {result.tokens[0]} -> {result.scores[0]:.3f}")
-                    print(f"  ✓ {explainer_name}")
+                    print(f"   {explainer_name}")
                 except Exception as e:
-                    print(f"  ✗ {explainer_name}: {e}")
+                    print(f"   {explainer_name}: {e}")
             
             models.clear_gpu_memory()
             

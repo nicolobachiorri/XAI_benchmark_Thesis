@@ -166,11 +166,11 @@ if __name__ == "__main__":
             
             # Tokenizer
             tokenizer = load_tokenizer(model_key)
-            print(f"  Tokenizer: ✓")
+            print(f"  Tokenizer: ")
             
             # Model
             model = load_model(model_key)
-            print(f"  Model: ✓")
+            print(f"  Model: ")
             
             # Inference test
             test_text = "This is a test."
@@ -180,7 +180,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 outputs = model(**encoded)
             
-            print(f"  Inference: ✓ (shape: {outputs.logits.shape})")
+            print(f"  Inference:  (shape: {outputs.logits.shape})")
             print(f"  SUCCESS: {model_key}")
             
             # Cleanup

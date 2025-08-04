@@ -1,15 +1,15 @@
 """
-report.py – Report XAI 
+report.py – Report XAI + HUMAN REASONING
 ====================================================================
 
-OTTIMIZZAZIONI MANTENUTE:
+OTTIMIZZAZIONI MANTENUTE + HUMAN REASONING:
 1. Adaptive Batch Size: Dimensioni batch dinamiche basate su memoria disponibile
 2. Embedding Caching: Cache intelligente per embeddings e tokenizzazioni
 3. Memory Management: Cleanup progressivo tra batch con monitoraggio
 4. GPU Optimization: CUDA sync ottimizzato, memory pool management
 5. Thread Pools: I/O operations parallele per salvataggio/caricamento
 6. Smart Resource Allocation: Allocazione dinamica risorse
-
+7. **HUMAN REASONING INTEGRATION**: Valutazione automatica accordo con ranking LLM
 
 Uso in Colab:
 ```python
@@ -18,14 +18,20 @@ import report
 # Report ultra-veloce
 report.turbo_report()
 
-# Report personalizzato
+# Report personalizzato con Human Reasoning
 report.run_optimized_report(
     models=["tinybert", "distilbert"],
     explainers=["lime", "shap", "grad_input"], 
-    metrics=["robustness", "consistency"],
+    metrics=["robustness", "consistency", "human_reasoning"],
     enable_caching=True,
     adaptive_batching=True
 )
+
+# Check HR status
+report.check_hr_status()
+
+# Generate HR ground truth
+report.generate_hr_ground_truth("your_api_key")
 ```
 """
 
@@ -55,15 +61,16 @@ import models
 import dataset
 import explainers
 import metrics
+import HumanReasoning as hr
 from utils import Timer, PerformanceProfiler, AutoRecovery, print_memory_status, aggressive_cleanup, set_seed
 
 # =============================================================================
-# CONFIGURAZIONE OTTIMIZZAZIONI SEMPLIFICATA
+# CONFIGURAZIONE OTTIMIZZAZIONI SEMPLIFICATA + HUMAN REASONING
 # =============================================================================
 
-# Configurazione base
+# Configurazione base - AGGIUNTO HUMAN REASONING
 EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow", "lrp"]
-METRICS = ["robustness", "contrastivity", "consistency"]
+METRICS = ["robustness", "contrastivity", "consistency", "human_reasoning"]
 DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 
 # Configurazione ottimizzazioni
@@ -78,7 +85,72 @@ MEMORY_THRESHOLD_GB = 2.0  # Soglia minima memoria per ottimizzazioni
 set_seed(42)
 
 # =============================================================================
-# GESTIONE MEMORIA AVANZATA
+# HUMAN REASONING STATUS FUNCTIONS
+# =============================================================================
+
+def check_hr_status() -> Dict[str, Any]:
+    """Controlla status Human Reasoning per report."""
+    print(f"\n[HR-STATUS] Checking Human Reasoning availability...")
+    
+    hr_info = hr.get_info()
+    
+    print(f"[HR-STATUS] Available: {hr_info['available']}")
+    if hr_info['available']:
+        print(f"[HR-STATUS] Valid examples: {hr_info['valid_examples']}/{hr_info['total_examples']}")
+        print(f"[HR-STATUS] Average words: {hr_info['avg_words_per_example']:.1f}")
+    else:
+        print(f"[HR-STATUS] Not available - needs generation")
+    
+    return hr_info
+
+def generate_hr_ground_truth(api_key: str, sample_size: int = 400) -> bool:
+    """Genera Human Reasoning ground truth per report."""
+    print(f"\n[HR-GENERATE] Starting Human Reasoning generation...")
+    print(f"[HR-GENERATE] Sample size: {sample_size}")
+    print(f"[HR-GENERATE] Estimated time: {sample_size * 1.2 / 60:.1f} minutes")
+    
+    try:
+        with Timer(f"HR Generation ({sample_size} examples)"):
+            hr_dataset = hr.generate_ground_truth(
+                api_key=api_key,
+                sample_size=sample_size
+            )
+        
+        if hr_dataset is not None and len(hr_dataset) > 0:
+            valid_count = (hr_dataset['hr_count'] > 0).sum()
+            success_rate = valid_count / len(hr_dataset)
+            
+            print(f"[HR-GENERATE]  Generated {valid_count}/{len(hr_dataset)} valid examples ({success_rate:.1%})")
+            return success_rate > 0.5
+        else:
+            print(f"[HR-GENERATE]  Generation failed")
+            return False
+            
+    except Exception as e:
+        print(f"[HR-GENERATE]  Error: {e}")
+        return False
+
+def ensure_hr_availability(auto_generate: bool = False, api_key: Optional[str] = None) -> bool:
+    """Assicura che Human Reasoning sia disponibile per il report."""
+    hr_info = hr.get_info()
+    
+    if hr_info['available']:
+        if hr_info['valid_examples'] < 50:  # Soglia minima
+            print(f"[HR-ENSURE]  Too few valid examples ({hr_info['valid_examples']})")
+            return False
+        print(f"[HR-ENSURE]  Human Reasoning available with {hr_info['valid_examples']} examples")
+        return True
+    
+    if auto_generate and api_key:
+        print(f"[HR-ENSURE] Auto-generating Human Reasoning ground truth...")
+        return generate_hr_ground_truth(api_key)
+    else:
+        print(f"[HR-ENSURE]  Human Reasoning not available")
+        print(f"[HR-ENSURE] To enable: report.generate_hr_ground_truth('your_api_key')")
+        return False
+
+# =============================================================================
+# GESTIONE MEMORIA AVANZATA (MANTENUTA)
 # =============================================================================
 
 class AdvancedMemoryManager:
@@ -177,7 +249,7 @@ class AdvancedMemoryManager:
         self.cleanup_callbacks.append(callback)
 
 # =============================================================================
-# SISTEMA CACHING AVANZATO
+# SISTEMA CACHING AVANZATO (MANTENUTO)
 # =============================================================================
 
 class EmbeddingCache:
@@ -244,7 +316,7 @@ class EmbeddingCache:
               f"{self.cache_stats['saves']} saves")
 
 # =============================================================================
-# I/O THREAD POOL
+# I/O THREAD POOL (MANTENUTO)
 # =============================================================================
 
 class AsyncIOManager:
@@ -298,7 +370,7 @@ class AsyncIOManager:
         self.io_pool.shutdown(wait=True)
 
 # =============================================================================
-# GOOGLE DRIVE BACKUP FUNCTIONS
+# GOOGLE DRIVE BACKUP FUNCTIONS (MANTENUTE)
 # =============================================================================
 
 def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str = "XAI_Results") -> bool:
@@ -311,7 +383,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
         try:
             from google.colab import drive
             drive.mount('/content/drive')
-            print("[DRIVE] ✓ Google Drive mounted successfully")
+            print("[DRIVE]  Google Drive mounted successfully")
         except Exception as e:
             print(f"[DRIVE] Failed to mount Google Drive: {e}")
             return False
@@ -335,7 +407,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
         print("[DRIVE] Results directory not found")
         return False
     
-    # Trova file da copiare (RIMOSSO summary_files)
+    # Trova file da copiare
     files_to_copy = []
     
     # CSV tables
@@ -407,7 +479,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
     print(f"  Location: {timestamped_dir}")
     
     if copied_files > 0:
-        print(f"  ✓ Results safely backed up to Google Drive!")
+        print(f"   Results safely backed up to Google Drive!")
         print(f"  Access via: My Drive > {drive_folder} > report_{timestamp}")
     
     return success_rate > 0.8  # Success se almeno 80% files copied
@@ -445,10 +517,10 @@ def quick_drive_backup(results_dir: str = "xai_results") -> bool:
             
             shutil.copy2(csv_file, dest_path)
             copied += 1
-            print(f"[DRIVE] ✓ {csv_file.name}")
+            print(f"[DRIVE]  {csv_file.name}")
             
         except Exception as e:
-            print(f"[DRIVE] ✗ {csv_file.name}: {e}")
+            print(f"[DRIVE]  {csv_file.name}: {e}")
     
     return copied > 0
 
@@ -457,9 +529,9 @@ def quick_drive_backup(results_dir: str = "xai_results") -> bool:
 # =============================================================================
 
 def print_simplified_header():
-    """Header per report semplificato."""
+    """Header per report semplificato + Human Reasoning."""
     print("="*80)
-    print(" XAI COMPREHENSIVE REPORT - SIMPLIFIED VERSION")
+    print(" XAI COMPREHENSIVE REPORT + HUMAN REASONING")
     print("="*80)
     print(" Optimizations:")
     print("   - Adaptive batch sizing based on available memory")
@@ -468,10 +540,11 @@ def print_simplified_header():
     print("   - Asynchronous I/O operations")
     print("   - Progressive memory cleanup")
     print(" ")
-    print(" Simplified:")
+    print(" Features:")
     print("   - Sequential explainer processing (more reliable)")
-    print("   - Removed explainer parallelization complexity")
-    print("   - Focus on high-impact optimizations")
+    print("   - 4 metrics: Robustness, Consistency, Contrastivity, Human Reasoning")
+    print("   - Human Reasoning: LLM-generated importance rankings")
+    print("   - Automatic Google Drive backup")
     print("="*80)
 
 def get_system_resources():
@@ -492,11 +565,19 @@ def get_system_resources():
         gpu_text += f" ({gpu_info['memory_gb']:.1f}GB)"
     print(f"[SYSTEM] GPU: {gpu_text}")
     
+    # Human Reasoning status
+    hr_info = hr.get_info()
+    hr_text = "Available" if hr_info['available'] else "Not Available"
+    if hr_info['available']:
+        hr_text += f" ({hr_info['valid_examples']} examples)"
+    print(f"[SYSTEM] Human Reasoning: {hr_text}")
+    
     return {
         "ram_total_gb": ram_gb,
         "ram_available_gb": available_ram_gb,
         "cpu_count": cpu_count,
-        "gpu_info": gpu_info
+        "gpu_info": gpu_info,
+        "hr_available": hr_info['available']
     }
 
 def process_model_simplified(
@@ -506,12 +587,13 @@ def process_model_simplified(
     sample_size: int,
     enable_caching: bool = True,
     adaptive_batching: bool = True,
-    recovery: AutoRecovery = None
+    recovery: AutoRecovery = None,
+    hr_dataset = None  # Pre-loaded HR dataset
 ) -> Dict[str, Dict[str, float]]:
-    """Processa singolo modello con ottimizzazioni semplificate."""
+    """Processa singolo modello con ottimizzazioni semplificate + Human Reasoning."""
     
     print(f"\n{'='*70}")
-    print(f" PROCESSING MODEL: {model_key} (SIMPLIFIED)")
+    print(f" PROCESSING MODEL: {model_key} (SIMPLIFIED + HR)")
     print(f"{'='*70}")
     
     # Inizializza manager
@@ -558,6 +640,20 @@ def process_model_simplified(
         consistency_texts = texts[:min(optimal_batch_size, len(texts))]
         
         print(f"[DATA] Batch sizes - Pos: {len(pos_texts)}, Neg: {len(neg_texts)}, Consistency: {len(consistency_texts)}")
+        
+        # Check Human Reasoning availability se richiesto
+        hr_available = hr_dataset is not None
+        if "human_reasoning" in metrics_to_compute:
+            if not hr_available:
+                print(f"[HR] Human Reasoning dataset not provided, loading...")
+                hr_dataset = hr.load_ground_truth()
+                hr_available = hr_dataset is not None
+            
+            if hr_available:
+                valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
+                print(f"[HR] Using {valid_hr_count} valid HR examples")
+            else:
+                print(f"[HR]  Human Reasoning not available - will skip HR metric")
         
         # Inizializza risultati
         results = {}
@@ -620,6 +716,21 @@ def process_model_simplified(
                                 seeds=DEFAULT_CONSISTENCY_SEEDS,
                                 show_progress=False
                             )
+                            
+                        elif metric_name == "human_reasoning":
+                            if hr_available and hr_dataset is not None:
+                                score = metrics.evaluate_human_reasoning_over_dataset(
+                                    model=model,
+                                    tokenizer=tokenizer,
+                                    explainer=explainer,
+                                    hr_dataset=hr_dataset,
+                                    show_progress=False
+                                )
+                            else:
+                                print("SKIPPED (HR not available)")
+                                score = float('nan')
+                                continue
+                                
                         else:
                             score = float('nan')
                         
@@ -786,9 +897,9 @@ def verify_checkpoint_completeness(
     return True, f"complete with {valid_results_count}/{total_expected} valid results ({completeness_ratio:.1%})"
 
 def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[str]) -> Dict[str, pd.DataFrame]:
-    """Costruisce tabelle finali dai risultati."""
+    """Costruisce tabelle finali dai risultati (incluso Human Reasoning)."""
     print(f"\n{'='*70}")
-    print(" BUILDING REPORT TABLES (SIMPLIFIED)")
+    print(" BUILDING REPORT TABLES (SIMPLIFIED + HR)")
     print(f"{'='*70}")
     
     tables = {}
@@ -822,7 +933,7 @@ def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[s
     return tables
 
 def print_table_analysis(df: pd.DataFrame, metric_name: str):
-    """Analisi e interpretazione tabella."""
+    """Analisi e interpretazione tabella (incluso Human Reasoning)."""
     print(f"\n{'='*60}")
     print(f" {metric_name.upper()} ANALYSIS")
     print(f"{'='*60}")
@@ -869,7 +980,7 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
         if metric_name == "robustness":
             flat_data.sort(key=lambda x: x[2])  # Lower is better
             direction = "(Lower = Better)"
-        else:
+        else:  # consistency, contrastivity, human_reasoning - higher is better
             flat_data.sort(key=lambda x: x[2], reverse=True)  # Higher is better
             direction = "(Higher = Better)"
         
@@ -886,6 +997,19 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
     print(f"  Total combinations: {total_cells}")
     print(f"  Completed: {filled_cells}")
     print(f"  Coverage: {coverage:.1%}")
+    
+    # Metric-specific insights
+    if metric_name == "human_reasoning":
+        print(f"\n Human Reasoning Insights:")
+        if not df.empty:
+            overall_mean = df.stack().mean()
+            print(f"  Overall agreement: {overall_mean:.4f} (MAP score)")
+            if overall_mean > 0.6:
+                print(f"  → Good alignment with human-like reasoning")
+            elif overall_mean > 0.4:
+                print(f"  → Moderate alignment with human-like reasoning")
+            else:
+                print(f"  → Poor alignment with human-like reasoning")
 
 # =============================================================================
 # MAIN REPORT FUNCTIONS
@@ -900,9 +1024,11 @@ def run_simplified_report(
     adaptive_batching: bool = True,
     resume: bool = True,
     drive_folder: str = "XAI_Results",
-    no_backup: bool = False
+    no_backup: bool = False,
+    hr_api_key: Optional[str] = None,  # NEW: API key for HR generation
+    auto_generate_hr: bool = False     # NEW: Auto-generate HR if missing
 ) -> Dict[str, pd.DataFrame]:
-    """Esegue report completo con architettura semplificata."""
+    """Esegue report completo con architettura semplificata + Human Reasoning."""
     
     start_time = time.time()
     profiler = PerformanceProfiler()
@@ -938,6 +1064,39 @@ def run_simplified_report(
             print(f"[WARNING] Low memory ({system_resources['ram_available_gb']:.1f}GB), disabling some optimizations")
             adaptive_batching = False
         
+        # HUMAN REASONING SETUP
+        hr_dataset = None
+        if "human_reasoning" in metrics_to_compute:
+            print(f"\n[HR-SETUP] Human Reasoning metric requested...")
+            
+            # Check availability
+            if not system_resources["hr_available"]:
+                print(f"[HR-SETUP] Human Reasoning not available")
+                
+                if auto_generate_hr and hr_api_key:
+                    print(f"[HR-SETUP] Auto-generating Human Reasoning ground truth...")
+                    hr_success = generate_hr_ground_truth(hr_api_key)
+                    if hr_success:
+                        hr_dataset = hr.load_ground_truth()
+                        print(f"[HR-SETUP]  Human Reasoning generated and loaded")
+                    else:
+                        print(f"[HR-SETUP]  Human Reasoning generation failed")
+                        metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+                        print(f"[HR-SETUP] Removed human_reasoning from metrics")
+                else:
+                    print(f"[HR-SETUP]  Human Reasoning will be skipped")
+                    print(f"[HR-SETUP] To enable: provide hr_api_key and set auto_generate_hr=True")
+                    # Keep the metric but it will be skipped during processing
+            else:
+                # Load existing HR dataset
+                hr_dataset = hr.load_ground_truth()
+                if hr_dataset is not None:
+                    valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
+                    print(f"[HR-SETUP]  Loaded {valid_hr_count} valid HR examples")
+                else:
+                    print(f"[HR-SETUP]  Failed to load HR dataset")
+                    metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+        
         total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
         
         print(f"\n[REPORT] Simplified Configuration:")
@@ -947,10 +1106,12 @@ def run_simplified_report(
         print(f"  Sample size: {sample_size}")
         print(f"  Total combinations: {total_combinations}")
         print(f"  Optimizations: Cache={enable_caching}, Adaptive={adaptive_batching}")
+        if hr_dataset is not None:
+            print(f"  Human Reasoning: Available with {(hr_dataset['hr_count'] > 0).sum()} examples")
         
         # FASE 1: Process each model sequentially
         print(f"\n{'='*80}")
-        print("FASE 1: SIMPLIFIED MODEL PROCESSING")
+        print("FASE 1: SIMPLIFIED MODEL PROCESSING + HR")
         print(f"{'='*80}")
         
         all_results = {}
@@ -976,7 +1137,7 @@ def run_simplified_report(
                         print(f"[RESUME] Incomplete checkpoint: {reason}")
             
             try:
-                with Timer(f"Processing {model_key} (simplified)"):
+                with Timer(f"Processing {model_key} (simplified + HR)"):
                     results = process_model_simplified(
                         model_key=model_key,
                         explainers_to_test=explainers_to_test,
@@ -984,7 +1145,8 @@ def run_simplified_report(
                         sample_size=sample_size,
                         enable_caching=enable_caching,
                         adaptive_batching=adaptive_batching,
-                        recovery=recovery
+                        recovery=recovery,
+                        hr_dataset=hr_dataset  # Pass HR dataset
                     )
                     all_results[model_key] = {"results": results, "completed": True}
                 
@@ -1000,7 +1162,7 @@ def run_simplified_report(
         
         # FASE 2: Build tables
         print(f"\n{'='*80}")
-        print("FASE 2: BUILDING SIMPLIFIED TABLES")
+        print("FASE 2: BUILDING SIMPLIFIED TABLES + HR")
         print(f"{'='*80}")
         
         profiler.start_operation("table_building")
@@ -1009,7 +1171,7 @@ def run_simplified_report(
         
         # FASE 3: Analysis & Output
         print(f"\n{'='*80}")
-        print("FASE 3: SIMPLIFIED ANALYSIS & OUTPUT")
+        print("FASE 3: SIMPLIFIED ANALYSIS & OUTPUT + HR")
         print(f"{'='*80}")
         
         execution_time = time.time() - start_time
@@ -1031,15 +1193,22 @@ def run_simplified_report(
         
         profiler.end_operation("simplified_report")
         
-        # Final summary (SOLO CONSOLE OUTPUT, NO FILE)
+        # Final summary
         print(f"\n{'='*80}")
-        print(" SIMPLIFIED REPORT COMPLETED SUCCESSFULLY!")
+        print(" SIMPLIFIED REPORT + HR COMPLETED SUCCESSFULLY!")
         print(f"{'='*80}")
         print(f"  Total time: {execution_time/60:.1f} minutes")
         print(f"  Models processed: {len([r for r in all_results.values() if r.get('completed', False)])}/{len(models_to_test)}")
         print(f"  Tables generated: {len([t for t in tables.values() if not t.empty])}")
         print(f"  Files saved in: {RESULTS_DIR}")
         print(f"  Total data points: {sum(df.notna().sum().sum() for df in tables.values())}")
+        
+        # Human Reasoning specific summary
+        if "human_reasoning" in metrics_to_compute and "human_reasoning" in tables:
+            hr_table = tables["human_reasoning"]
+            if not hr_table.empty:
+                hr_mean = hr_table.stack().mean()
+                print(f"  Human Reasoning avg: {hr_mean:.4f} (MAP score)")
         
         # Performance summary
         profiler.print_summary()
@@ -1059,20 +1228,24 @@ def run_simplified_report(
         return tables
         
     except Exception as e:
-        print(f"\nSIMPLIFIED REPORT FAILED: {e}")
+        print(f"\nSIMPLIFIED REPORT + HR FAILED: {e}")
         import traceback
         traceback.print_exc()
         return {}
 
-def turbo_report(sample_size: int = 50) -> Dict[str, pd.DataFrame]:
-    """Report ultra-veloce con architettura semplificata."""
+def turbo_report(sample_size: int = 50, include_hr: bool = False, hr_api_key: Optional[str] = None) -> Dict[str, pd.DataFrame]:
+    """Report ultra-veloce con architettura semplificata + opzionale Human Reasoning."""
     print_simplified_header()
-    print("[TURBO] Ultra-fast report with simplified architecture")
+    print("[TURBO] Ultra-fast report with simplified architecture + optional HR")
     
     # Configuration for maximum speed
     models_subset = ["tinybert", "distilbert"]  # Fastest models
     explainers_subset = ["lime", "grad_input"]  # Fast explainers
-    metrics_subset = ["robustness"]            # Single metric for speed
+    
+    if include_hr:
+        metrics_subset = ["robustness", "human_reasoning"]  # Include HR
+    else:
+        metrics_subset = ["robustness"]  # Single metric for speed
     
     return run_simplified_report(
         models_to_test=models_subset,
@@ -1081,7 +1254,9 @@ def turbo_report(sample_size: int = 50) -> Dict[str, pd.DataFrame]:
         sample_size=sample_size,
         enable_caching=True,
         adaptive_batching=True,
-        resume=True
+        resume=True,
+        hr_api_key=hr_api_key,
+        auto_generate_hr=include_hr
     )
 
 def get_available_resources():
@@ -1091,8 +1266,15 @@ def get_available_resources():
     
     print(f"[RESOURCES] Models: {len(available_models)} available")
     print(f"[RESOURCES] Explainers: {len(available_explainers)} available")
-    print(f"[RESOURCES] Metrics: {len(METRICS)} available")
+    print(f"[RESOURCES] Metrics: {len(METRICS)} available (including Human Reasoning)")
     print(f"[RESOURCES] Dataset: {len(dataset.test_df)} clustered examples")
+    
+    # Human Reasoning status
+    hr_info = hr.get_info()
+    if hr_info['available']:
+        print(f"[RESOURCES] Human Reasoning: {hr_info['valid_examples']} valid examples")
+    else:
+        print(f"[RESOURCES] Human Reasoning: Not available (can be generated)")
     
     return available_models, available_explainers
 
@@ -1105,13 +1287,13 @@ run_optimized_report = run_simplified_report
 
 def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="XAI Report Generator - Simplified Version")
+    parser = argparse.ArgumentParser(description="XAI Report Generator - Simplified Version + Human Reasoning")
     parser.add_argument("--models", nargs="+", choices=list(models.MODELS.keys()), 
                        default=None, help="Models to test")
     parser.add_argument("--explainers", nargs="+", choices=EXPLAINERS,
                        default=None, help="Explainers to test")
     parser.add_argument("--metrics", nargs="+", choices=METRICS,
-                       default=None, help="Metrics to compute")
+                       default=None, help="Metrics to compute (includes human_reasoning)")
     parser.add_argument("--sample", type=int, default=100, help="Sample size")
     parser.add_argument("--turbo", action="store_true", help="Ultra-fast turbo report")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching")
@@ -1121,10 +1303,30 @@ def main():
     parser.add_argument("--drive-folder", default="XAI_Results", help="Google Drive folder name")
     parser.add_argument("--no-backup", action="store_true", help="Disable automatic backup")
     
+    # Human Reasoning arguments
+    parser.add_argument("--hr-api-key", help="OpenRouter API key for Human Reasoning")
+    parser.add_argument("--auto-generate-hr", action="store_true", help="Auto-generate HR if missing")
+    parser.add_argument("--include-hr", action="store_true", help="Include HR in turbo mode")
+    parser.add_argument("--hr-status", action="store_true", help="Check HR status and exit")
+    parser.add_argument("--hr-generate", action="store_true", help="Generate HR ground truth and exit")
+    
     args = parser.parse_args()
     
-    print("XAI BENCHMARK - SIMPLIFIED VERSION")
-    print("="*50)
+    # Handle HR-specific commands first
+    if args.hr_status:
+        check_hr_status()
+        return
+    
+    if args.hr_generate:
+        if not args.hr_api_key:
+            print("[ERROR] HR API key required for generation")
+            print("Get your key from: https://openrouter.ai/")
+            sys.exit(1)
+        success = generate_hr_ground_truth(args.hr_api_key)
+        sys.exit(0 if success else 1)
+    
+    print("XAI BENCHMARK - SIMPLIFIED VERSION + HUMAN REASONING")
+    print("="*60)
     print("Simplifications:")
     print("- Sequential explainer processing")
     print("- Removed parallelization complexity") 
@@ -1135,11 +1337,19 @@ def main():
     print("- Advanced memory management")
     print("- GPU optimizations")
     print("- Async I/O operations")
-    print("="*50)
+    print("Human Reasoning:")
+    print("- LLM-generated importance rankings")
+    print("- Mean Average Precision evaluation")
+    print("- Optional auto-generation")
+    print("="*60)
     
     if args.turbo:
         print("Running turbo report...")
-        tables = turbo_report(sample_size=min(args.sample, 50))
+        tables = turbo_report(
+            sample_size=min(args.sample, 50),
+            include_hr=args.include_hr,
+            hr_api_key=args.hr_api_key
+        )
     else:
         print("Running simplified report...")
         tables = run_simplified_report(
@@ -1151,14 +1361,16 @@ def main():
             adaptive_batching=not args.no_adaptive,
             resume=args.resume,
             drive_folder=args.drive_folder,
-            no_backup=args.no_backup
+            no_backup=args.no_backup,
+            hr_api_key=args.hr_api_key,
+            auto_generate_hr=args.auto_generate_hr
         )
     
     if not any(not df.empty for df in tables.values()):
         print("No results generated!")
         sys.exit(1)
     else:
-        print("Simplified report completed successfully!")
+        print("Simplified report + HR completed successfully!")
 
 if __name__ == "__main__":
     main()

@@ -629,7 +629,7 @@ if __name__ == "__main__":
         
         print_metric_summary(robustness, consistency, contrastivity, hr_score)
         
-        print("\n✓ Metrics test completed!")
+        print("\n Metrics test completed!")
         
     except Exception as e:
         print(f"Test failed: {e}")

@@ -49,7 +49,7 @@ def setup_colab_environment():
     except ImportError:
         pass
     
-    print("[SETUP] ✓ Colab environment configured")
+    print("[SETUP]  Colab environment configured")
 
 # Setup automatico
 setup_colab_environment()
@@ -163,7 +163,7 @@ def aggressive_cleanup():
     # Force garbage collection again
     gc.collect()
     
-    print("[CLEANUP] ✓ Memory cleanup completed")
+    print("[CLEANUP]  Memory cleanup completed")
 
 # ==== Performance Tracking ====
 class Timer:
@@ -437,18 +437,18 @@ def run_colab_diagnostics():
     print("\n[TEST] Memory allocation test...")
     try:
         test_tensor = torch.randn(1000, 1000).cuda() if torch.cuda.is_available() else torch.randn(1000, 1000)
-        print("[TEST] ✓ Memory allocation successful")
+        print("[TEST]  Memory allocation successful")
         del test_tensor
         aggressive_cleanup()
     except Exception as e:
-        print(f"[TEST] ✗ Memory allocation failed: {e}")
+        print(f"[TEST]  Memory allocation failed: {e}")
     
     # Performance test
     print("\n[TEST] Performance test...")
     with Timer("Performance test"):
         time.sleep(0.1)  # Simulate work
     
-    print("\n✓ Colab diagnostics completed!")
+    print("\n Colab diagnostics completed!")
 
 # ==== Initialize ====
 if __name__ == "__main__":
@@ -457,4 +457,4 @@ if __name__ == "__main__":
 else:
     # Auto-setup when imported
     set_seed(42)
-    print("[UTILS] ✓ Colab utilities loaded")
+    print("[UTILS]  Colab utilities loaded")

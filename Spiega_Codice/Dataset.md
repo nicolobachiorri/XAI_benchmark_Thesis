@@ -170,11 +170,11 @@ print(f"Riduzione: {len(test_df)/len(test_df_original):.1%}")  # ~8%
 Il sistema stampa statistiche complete:
 
 ```
-[CLUSTERING] ✓ 80 clusters created
+[CLUSTERING]  80 clusters created
 [CLUSTERING]   Cluster sizes: min=45, max=78, avg=62.5
-[SAMPLING] ✓ Final dataset: 400 samples
-[SAMPLING] ✓ Distribution: 201 positive, 199 negative
-[SAMPLING] ✓ Balance: 50.2% positive
+[SAMPLING]  Final dataset: 400 samples
+[SAMPLING]  Distribution: 201 positive, 199 negative
+[SAMPLING]  Balance: 50.2% positive
 [SAMPLING]   Cluster stats: 78 full, 2 partial, 0 empty
 ```
 
