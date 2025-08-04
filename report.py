@@ -1,5 +1,5 @@
 """
-report.py – Report XAI semplificato senza parallelizzazione explainer
+report.py – Report XAI 
 ====================================================================
 
 OTTIMIZZAZIONI MANTENUTE:
@@ -335,7 +335,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
         print("[DRIVE] Results directory not found")
         return False
     
-    # Trova file da copiare
+    # Trova file da copiare (RIMOSSO summary_files)
     files_to_copy = []
     
     # CSV tables
@@ -345,10 +345,6 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
     # JSON results
     json_files = list(results_path.glob("results_*.json"))
     files_to_copy.extend(json_files)
-    
-    # Summary reports
-    summary_files = list(results_path.glob("summary_report*.txt"))
-    files_to_copy.extend(summary_files)
     
     if not files_to_copy:
         print("[DRIVE] No files found to backup")
@@ -891,81 +887,6 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
     print(f"  Completed: {filled_cells}")
     print(f"  Coverage: {coverage:.1%}")
 
-def generate_summary_report(tables: Dict[str, pd.DataFrame], 
-                          execution_time: float,
-                          models_tested: List[str],
-                          explainers_tested: List[str],
-                          optimizations_used: Dict[str, bool]) -> str:
-    """Genera report summary testuale."""
-    
-    summary = f"""
-XAI BENCHMARK REPORT - SIMPLIFIED VERSION
-==========================================
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Execution Time: {execution_time/60:.1f} minutes
-Dataset: {len(dataset.test_df)} clustered examples from IMDB
-
-CONFIGURATION:
-- Models tested: {len(models_tested)} ({', '.join(models_tested)})
-- Explainers tested: {len(explainers_tested)} ({', '.join(explainers_tested)})
-- Metrics computed: {len(tables)} ({', '.join(tables.keys())})
-
-OPTIMIZATIONS ENABLED:
-- Embedding Caching: {'✓' if optimizations_used.get('caching', False) else '✗'}
-- Adaptive Batching: {'✓' if optimizations_used.get('adaptive_batching', False) else '✗'}
-- GPU Memory Pool: {'✓' if optimizations_used.get('gpu_optimization', False) else '✗'}
-- Async I/O: {'✓' if optimizations_used.get('async_io', False) else '✗'}
-- Sequential Processing: ✓ (simplified architecture)
-
-RESULTS SUMMARY:
-"""
-    
-    for metric_name, df in tables.items():
-        if not df.empty:
-            coverage = df.notna().sum().sum()
-            total = df.size
-            summary += f"\n{metric_name.upper()}:\n"
-            summary += f"  Coverage: {coverage}/{total} combinations completed ({coverage/total:.1%})\n"
-            
-            # Best combination
-            flat_data = []
-            for explainer in df.index:
-                for model in df.columns:
-                    value = df.loc[explainer, model]
-                    if not pd.isna(value):
-                        flat_data.append((explainer, model, value))
-            
-            if flat_data:
-                if metric_name == "robustness":
-                    best = min(flat_data, key=lambda x: x[2])
-                    summary += f"  Best: {best[0]} + {best[1]} = {best[2]:.4f} (most robust)\n"
-                else:
-                    best = max(flat_data, key=lambda x: x[2])
-                    summary += f"  Best: {best[0]} + {best[1]} = {best[2]:.4f} (highest score)\n"
-        else:
-            summary += f"\n{metric_name.upper()}: No data collected\n"
-    
-    summary += f"""
-SIMPLIFIED ARCHITECTURE BENEFITS:
-- Removed explainer parallelization complexity
-- More reliable sequential processing
-- Focus on high-impact optimizations (caching, batching, memory)
-- Simpler code maintenance and debugging
-- Consistent performance across all explainers
-
-RECOMMENDATIONS:
-- For production XAI: Use combinations with highest consistency scores
-- For research: Focus on high contrastivity explainers
-- For deployment: Balance robustness vs computational cost
-
-Files Generated:
-- Raw results: {RESULTS_DIR}/results_*_simplified.json
-- CSV tables: {RESULTS_DIR}/*_table.csv
-- Summary: {RESULTS_DIR}/summary_report_simplified.txt
-"""
-    
-    return summary
-
 # =============================================================================
 # MAIN REPORT FUNCTIONS
 # =============================================================================
@@ -1108,28 +1029,9 @@ def run_simplified_report(
                 # Analysis
                 print_table_analysis(df, metric_name)
         
-        # Generate simplified summary
-        optimizations_used = {
-            "caching": enable_caching,
-            "adaptive_batching": adaptive_batching,
-            "gpu_optimization": torch.cuda.is_available(),
-            "async_io": True,
-            "sequential_processing": True
-        }
-        
-        summary = generate_summary_report(
-            tables, execution_time, models_to_test, explainers_to_test, optimizations_used
-        )
-        
-        # Save summary
-        summary_file = RESULTS_DIR / "summary_report_simplified.txt"
-        with open(summary_file, 'w') as f:
-            f.write(summary)
-        print(f"[SAVE] Summary saved: {summary_file}")
-        
         profiler.end_operation("simplified_report")
         
-        # Final summary
+        # Final summary (SOLO CONSOLE OUTPUT, NO FILE)
         print(f"\n{'='*80}")
         print(" SIMPLIFIED REPORT COMPLETED SUCCESSFULLY!")
         print(f"{'='*80}")
