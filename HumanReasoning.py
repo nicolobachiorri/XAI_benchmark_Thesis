@@ -450,4 +450,3 @@ if __name__ == "__main__":
     print("import HumanReasoning as hr")
     print("hr.generate_ground_truth(api_key='your_key')  # Once")
     print("score = hr.evaluate_human_reasoning(model, tokenizer, explainer)")
-    
