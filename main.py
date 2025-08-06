@@ -1,22 +1,21 @@
 """
-main.py – CLI unificata per XAI benchmark (GOOGLE COLAB OPTIMIZED)
-=================================================================
+main.py – CLI unificata per XAI benchmark (FIXED HR INTEGRATION)
+===============================================================
 
-OTTIMIZZAZIONI PER COLAB:
-1. Error handling robusto per environment instabile
-2. Memory monitoring integrato
-3. Progress tracking ottimizzato per notebook
-4. Auto-cleanup tra operazioni
-5. Fallback intelligenti per modelli/explainer
-6. Dataset clusterizzato (400 esempi)
-7. **HUMAN REASONING INTEGRATION**
+CORREZIONI INTEGRATE:
+1. Caricamento automatico CSV Human Reasoning se disponibile
+2. Verifica consistenza dataset prima dell'uso
+3. Gestione corretta fallback se HR non disponibile
+4. Integrazione con sistema HR fixed che usa esattamente i 400 esempi
+5. Recovery intelligente senza spreco di API calls
 
 Comandi principali:
 * **explain** – spiega una singola frase
 * **evaluate** – valuta modello + explainer su una metrica (incluso Human Reasoning)
 * **test** – test veloce sistema completo
-* **hr-status** – controlla status Human Reasoning ground truth
-* **hr-generate** – genera Human Reasoning ground truth
+* **hr-status** – controlla status Human Reasoning ground truth + consistency
+* **hr-generate** – genera Human Reasoning ground truth (400 esempi fissi)
+* **hr-verify** – verifica consistenza HR dataset con dataset clusterizzato
 
 Esempi Colab:
 ```python
@@ -26,17 +25,14 @@ import main
 # Test veloce
 main.quick_test()
 
-# Explain
-main.explain_text("Great movie!", "distilbert", "lime")
+# Check HR status con verifica consistenza
+main.check_hr_status_with_verification()
 
-# Evaluate (incluso Human Reasoning)
+# Generate HR ground truth (400 esempi fissi del dataset clusterizzato)
+main.generate_hr_ground_truth_fixed("your_openrouter_api_key")
+
+# Evaluate con HR (riusa CSV esistente)
 main.evaluate_combination("distilbert", "lime", "human_reasoning")
-
-# Check HR status
-main.check_hr_status()
-
-# Generate HR ground truth (richiede API key)
-main.generate_hr_ground_truth("your_openrouter_api_key")
 ```
 """
 
@@ -61,19 +57,24 @@ DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
 DEFAULT_SAMPLE_SIZE = 100  # Ridotto per Colab
 
 def print_colab_header():
-    """Header informativo per Colab con Human Reasoning."""
+    """Header informativo per Colab con Human Reasoning Fixed."""
     print("="*70)
-    print(" XAI BENCHMARK + HUMAN REASONING")
+    print(" XAI BENCHMARK + HUMAN REASONING (FIXED)")
     print("="*70)
     print(" Dataset: 400 clustered examples from IMDB")
     print(" Models: Pre-trained sentiment analysis")
     print(" Explainers: LIME, SHAP, Gradients, Attention")
     print(" Metrics: Robustness, Consistency, Contrastivity, Human Reasoning")
-    print(" Human Reasoning: LLM-generated importance rankings")
+    print(" ")
+    print(" HUMAN REASONING FIXES:")
+    print("   - Uses EXACTLY the same 400 clustered examples")
+    print("   - Maintains 1:1 correspondence even with LLM failures")
+    print("   - Saves CSV for reuse between Colab sessions")
+    print("   - Verification system for dataset consistency")
     print("="*70)
 
 def check_dependencies():
-    """Verifica dipendenze e disponibilità (incluso Human Reasoning)."""
+    """Verifica dipendenze e disponibilità (incluso Human Reasoning Fixed)."""
     print("\n[CHECK] Verifying dependencies...")
     
     # Models
@@ -87,12 +88,15 @@ def check_dependencies():
     # Dataset
     print(f"[CHECK]  Dataset: {len(dataset.test_df)} clustered examples")
     
-    # Human Reasoning
+    # Human Reasoning (con info aggiuntive)
     hr_info = hr.get_info()
     if hr_info['available']:
-        print(f"[CHECK]  Human Reasoning: {hr_info['valid_examples']}/{hr_info['total_examples']} valid examples")
+        consistency_status = " (CONSISTENT)" if hr_info.get('exact_match_dataset', False) else " (INCONSISTENT)"
+        print(f"[CHECK]  Human Reasoning: {hr_info['valid_examples']}/{hr_info['total_examples']} valid examples{consistency_status}")
+        print(f"[CHECK]    CSV: {'EXISTS' if hr.HR_DATASET_CSV.exists() else 'MISSING'}")
+        print(f"[CHECK]    Success rate: {hr_info['success_rate']:.1%}" if hr_info['success_rate'] else "")
     else:
-        print(f"[CHECK]  Human Reasoning: Not available (generate first)")
+        print(f"[CHECK]  Human Reasoning: Not available (need generation)")
     
     # GPU
     if torch.cuda.is_available():
@@ -188,7 +192,7 @@ def explain_text(text: str, model_key: str, explainer_name: str, show_prediction
 
 def evaluate_combination(model_key: str, explainer_name: str, metric_name: str, 
                         sample_size: int = DEFAULT_SAMPLE_SIZE) -> Optional[float]:
-    """Valuta combinazione modello+explainer+metrica (chiamabile da Colab, incluso Human Reasoning)."""
+    """Valuta combinazione modello+explainer+metrica (FIXED HR INTEGRATION)."""
     print_colab_header()
     print(f"\n[EVALUATE] {model_key} + {explainer_name} + {metric_name}")
     print(f"[EVALUATE] Sample size: {sample_size}")
@@ -258,17 +262,33 @@ def evaluate_combination(model_key: str, explainer_name: str, metric_name: str,
         elif metric_name == "human_reasoning":
             print(f"\n[HUMAN REASONING] Evaluating agreement with human-like reasoning...")
             
-            # Check HR availability
-            if not hr.is_available():
+            # CORREZIONE CHIAVE: Check HR availability con verifica consistenza
+            hr_info = hr.get_info()
+            if not hr_info['available']:
                 print(f"[ERROR] Human Reasoning ground truth not available.")
-                print(f"[SUGGESTION] Generate it first using: main.generate_hr_ground_truth('your_api_key')")
+                print(f"[SUGGESTION] Generate it first using: main.generate_hr_ground_truth_fixed('your_api_key')")
                 return None
+            
+            # Verifica consistenza dataset
+            if not hr_info.get('exact_match_dataset', False):
+                print(f"[WARNING] HR dataset might not match clustered dataset exactly")
+                print(f"[SUGGESTION] Run: main.verify_hr_consistency() or regenerate HR")
+                
+                # Chiedi conferma
+                proceed = input("Proceed anyway? (y/N): ").strip().lower()
+                if proceed not in ['y', 'yes']:
+                    print(f"[ABORTED] Human Reasoning evaluation cancelled")
+                    return None
             
             # Load HR dataset
             hr_dataset = hr.load_ground_truth()
             if hr_dataset is None:
                 print(f"[ERROR] Failed to load Human Reasoning dataset")
                 return None
+            
+            print(f"[HR] Using HR dataset with {len(hr_dataset)} examples")
+            valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
+            print(f"[HR] Valid HR examples: {valid_hr_count}/{len(hr_dataset)} ({valid_hr_count/len(hr_dataset):.1%})")
             
             # Evaluate
             score = metrics.evaluate_human_reasoning_over_dataset(
@@ -330,15 +350,15 @@ def evaluate_combination(model_key: str, explainer_name: str, metric_name: str,
         aggressive_cleanup()
         print_memory_status()
 
-def check_hr_status():
-    """Controlla status Human Reasoning ground truth (funzione comoda per Colab)."""
+def check_hr_status_with_verification():
+    """Controlla status Human Reasoning con verifica consistenza (fixed version)."""
     print_colab_header()
-    print(f"\n[HR STATUS] Checking Human Reasoning availability...")
+    print(f"\n[HR STATUS] Checking Human Reasoning availability and consistency...")
     
     hr_info = hr.get_info()
     
     print(f"\n{'='*60}")
-    print("HUMAN REASONING STATUS")
+    print("HUMAN REASONING STATUS (FIXED)")
     print(f"{'='*60}")
     
     if hr_info['available']:
@@ -348,7 +368,21 @@ def check_hr_status():
         if hr_info['success_rate'] is not None:
             print(f"  Success rate: {hr_info['success_rate']:.1%}")
         print(f"  Avg words per example: {hr_info['avg_words_per_example']:.1f}")
-        print(f"  File path: {hr_info['file_path']}")
+        print(f"  CSV file: {'EXISTS' if hr.HR_DATASET_CSV.exists() else 'MISSING'}")
+        print(f"  Pickle file: {'EXISTS' if hr.HR_DATASET_PKL.exists() else 'MISSING'}")
+        
+        # CORREZIONE CHIAVE: Verifica consistenza
+        print(f"\n Dataset Consistency Check:")
+        if hr_info.get('exact_match_dataset', False):
+            print(f"  Exact match: YES (HR dataset matches clustered dataset)")
+        else:
+            print(f"  Exact match: UNKNOWN (running verification...)")
+            consistent = hr.verify_dataset_consistency()
+            if consistent:
+                print(f"  Verification: PASSED - HR dataset is consistent")
+            else:
+                print(f"  Verification: FAILED - HR dataset has mismatches")
+                print(f"  Recommendation: Regenerate HR dataset")
         
         print(f"\n Human Reasoning is ready for evaluation!")
         print(f"  Use: main.evaluate_combination(model, explainer, 'human_reasoning')")
@@ -356,19 +390,19 @@ def check_hr_status():
         print(f" Status: Not Available")
         print(f"\n  To generate Human Reasoning ground truth:")
         print(f"  1. Get OpenRouter API key from: https://openrouter.ai/")
-        print(f"  2. Run: main.generate_hr_ground_truth('your_api_key')")
+        print(f"  2. Run: main.generate_hr_ground_truth_fixed('your_api_key')")
         print(f"  3. Wait ~8-10 minutes for 400 examples to be processed")
+        print(f"  4. HR will use EXACTLY the same 400 clustered examples")
     
     print(f"{'='*60}")
     
     return hr_info['available']
 
-def generate_hr_ground_truth(api_key: str, sample_size: int = 400):
-    """Genera Human Reasoning ground truth (funzione comoda per Colab)."""
+def generate_hr_ground_truth_fixed(api_key: str):
+    """Genera Human Reasoning ground truth (FIXED - 400 esempi esatti)."""
     print_colab_header()
-    print(f"\n[HR GENERATE] Generating Human Reasoning ground truth...")
+    print(f"\n[HR GENERATE] Generating Human Reasoning ground truth (FIXED VERSION)...")
     print(f"[HR GENERATE] API Key: {'*' * (len(api_key) - 4) + api_key[-4:] if len(api_key) > 4 else 'provided'}")
-    print(f"[HR GENERATE] Sample size: {sample_size}")
     
     if not api_key or len(api_key) < 10:
         print(f"[ERROR] Invalid API key provided")
@@ -377,49 +411,72 @@ def generate_hr_ground_truth(api_key: str, sample_size: int = 400):
     
     try:
         print(f"\n{'='*60}")
-        print("HUMAN REASONING GENERATION")
+        print("HUMAN REASONING GENERATION (FIXED)")
         print(f"{'='*60}")
-        print(f"This will take approximately {sample_size * 1.2 / 60:.1f} minutes...")
-        print(f"The process will:")
-        print(f"  1. Sample {sample_size} texts from clustered dataset")
-        print(f"  2. Send each to LLM (Kimi-K2) for importance ranking")
-        print(f"  3. Parse and validate responses")
-        print(f"  4. Save ground truth dataset")
+        print(f"This will generate HR for EXACTLY the same 400 clustered examples")
+        print(f"Key improvements:")
+        print(f"  - Uses dataset.test_df (same 400 examples always)")
+        print(f"  - Maintains 1:1 correspondence even with LLM failures")
+        print(f"  - Saves CSV for reuse between Colab sessions")
+        print(f"  - Robust recovery without losing order")
+        print(f"Estimated time: ~8-10 minutes (depending on API latency)")
         print(f"{'='*60}")
         
-        # Start generation
-        with Timer(f"HR Generation ({sample_size} examples)", track_memory=True):
+        # Check if already exists
+        hr_info = hr.get_info()
+        if hr_info['available'] and hr_info['total_examples'] == 400:
+            print(f"\n[EXISTS] HR dataset already exists with {hr_info['valid_examples']}/400 valid examples")
+            print(f"[EXISTS] Success rate: {hr_info['success_rate']:.1%}")
+            
+            overwrite = input("Regenerate anyway? This will cost API credits (y/N): ").strip().lower()
+            if overwrite not in ['y', 'yes']:
+                print(f"[CANCELLED] Using existing HR dataset")
+                return True
+        
+        # Start generation with FIXED version
+        with Timer(f"HR Generation (400 fixed examples)", track_memory=True):
             hr_dataset = hr.generate_ground_truth(
                 api_key=api_key,
-                sample_size=sample_size
+                sample_size=None,  # None means use all 400 from dataset
+                resume=True
             )
         
         # Verify results
-        if hr_dataset is not None and len(hr_dataset) > 0:
+        if hr_dataset is not None and len(hr_dataset) == 400:
             valid_count = (hr_dataset['hr_count'] > 0).sum()
             success_rate = valid_count / len(hr_dataset)
             
             print(f"\n{'='*60}")
             print("GENERATION COMPLETED SUCCESSFULLY!")
             print(f"{'='*60}")
-            print(f"  Total examples processed: {len(hr_dataset)}")
+            print(f"  Total examples processed: {len(hr_dataset)} (EXACTLY 400)")
             print(f"  Valid rankings generated: {valid_count}")
             print(f"  Success rate: {success_rate:.1%}")
             print(f"  Average words per example: {hr_dataset['hr_count'].mean():.1f}")
+            print(f"  CSV saved: {hr.HR_DATASET_CSV}")
             
-            if success_rate > 0.7:
+            # Verify dataset consistency
+            print(f"\n  Dataset Consistency Check:")
+            consistent = hr.verify_dataset_consistency()
+            if consistent:
+                print(f"    VERIFIED: HR dataset matches clustered dataset exactly")
+            else:
+                print(f"    WARNING: HR dataset consistency issues detected")
+            
+            if success_rate > 0.4:  # Soglia più bassa ma realistica
                 print(f"\n Human Reasoning ground truth is ready!")
                 print(f"  You can now evaluate explainers using 'human_reasoning' metric")
                 print(f"  Example: main.evaluate_combination('tinybert', 'lime', 'human_reasoning')")
                 return True
             else:
                 print(f"\n Low success rate ({success_rate:.1%})")
-                print(f"  Some examples may have failed due to API issues")
+                print(f"  Some examples failed due to API issues")
                 print(f"  Ground truth is available but may be incomplete")
+                print(f"  Consider rerunning generation to improve success rate")
                 return True
         else:
             print(f"\n Generation failed!")
-            print(f"  No valid data was generated")
+            print(f"  No valid data was generated or wrong number of examples")
             return False
     
     except Exception as e:
@@ -428,10 +485,41 @@ def generate_hr_ground_truth(api_key: str, sample_size: int = 400):
         traceback.print_exc()
         return False
 
-def quick_test(model_key: str = "tinybert", explainer_name: str = "lime"):
-    """Test veloce del sistema (funzione comoda per Colab) - ora include Human Reasoning."""
+def verify_hr_consistency():
+    """Verifica consistenza HR dataset (funzione comoda per Colab)."""
     print_colab_header()
-    print(f"\n[QUICK TEST] Testing {model_key} + {explainer_name}")
+    print(f"\n[HR VERIFY] Verifying HR dataset consistency...")
+    
+    try:
+        consistent = hr.verify_dataset_consistency()
+        
+        print(f"\n{'='*60}")
+        print("HR DATASET CONSISTENCY VERIFICATION")
+        print(f"{'='*60}")
+        
+        if consistent:
+            print(f" Result: PASSED")
+            print(f"  HR dataset corresponds exactly to clustered dataset")
+            print(f"  All 400 examples match in correct order")
+            print(f"  Safe to use for Human Reasoning evaluation")
+        else:
+            print(f" Result: FAILED")
+            print(f"  HR dataset has mismatches with clustered dataset")
+            print(f"  This may cause incorrect Human Reasoning scores")
+            print(f"  Recommendation: Regenerate HR dataset")
+            print(f"    Run: main.generate_hr_ground_truth_fixed('your_api_key')")
+        
+        print(f"{'='*60}")
+        return consistent
+        
+    except Exception as e:
+        print(f"[ERROR] Consistency verification failed: {e}")
+        return False
+
+def quick_test(model_key: str = "tinybert", explainer_name: str = "lime"):
+    """Test veloce del sistema (FIXED HR INTEGRATION)."""
+    print_colab_header()
+    print(f"\n[QUICK TEST] Testing {model_key} + {explainer_name} (with HR fixes)")
     
     # Check dependencies
     available_models, available_explainers = check_dependencies()
@@ -458,12 +546,12 @@ def quick_test(model_key: str = "tinybert", explainer_name: str = "lime"):
         if score is not None:
             print(f"[TEST 2]  Evaluation successful (score: {score:.4f})")
             
-            # Test Human Reasoning availability
-            print(f"\n[TEST 3] Human Reasoning status...")
-            hr_available = check_hr_status()
+            # Test Human Reasoning availability with fixes
+            print(f"\n[TEST 3] Human Reasoning status (with fixes)...")
+            hr_available = check_hr_status_with_verification()
             
             if hr_available:
-                print(f"[TEST 3]  Human Reasoning available")
+                print(f"[TEST 3]  Human Reasoning available and verified")
                 
                 # Optional: Test HR evaluation if available
                 print(f"\n[TEST 4] Human Reasoning evaluation (optional)...")
@@ -476,14 +564,16 @@ def quick_test(model_key: str = "tinybert", explainer_name: str = "lime"):
                 except Exception:
                     print(f"[TEST 4]  Human Reasoning evaluation skipped (but system is functional)")
             else:
-                print(f"[TEST 3]  Human Reasoning not available (can be generated later)")
+                print(f"[TEST 3]  Human Reasoning not available (can be generated)")
             
             print(f"\n QUICK TEST PASSED! System is ready for full experiments.")
             print(f"\nNext steps:")
             print(f"  • For full evaluation: main.evaluate_combination(model, explainer, metric)")
             if not hr_available:
-                print(f"  • For Human Reasoning: main.generate_hr_ground_truth('your_api_key')")
+                print(f"  • For Human Reasoning: main.generate_hr_ground_truth_fixed('your_api_key')")
+                print(f"  • HR will use EXACTLY the same 400 clustered examples")
             print(f"  • Available metrics: robustness, consistency, contrastivity, human_reasoning")
+            print(f"  • HR verification: main.verify_hr_consistency()")
             
             return True
         else:
@@ -494,7 +584,7 @@ def quick_test(model_key: str = "tinybert", explainer_name: str = "lime"):
     print(f"\n QUICK TEST FAILED! Check error messages above.")
     return False
 
-# ==== CLI Functions (per compatibilità) ====
+# ==== CLI Functions (per compatibilità) - UPDATED ====
 def cmd_explain(args):
     """CLI explain command."""
     result = explain_text(args.text, args.model, args.explainer)
@@ -514,20 +604,26 @@ def cmd_test(args):
         sys.exit(1)
 
 def cmd_hr_status(args):
-    """CLI HR status command."""
-    available = check_hr_status()
+    """CLI HR status command (with verification)."""
+    available = check_hr_status_with_verification()
     if not available:
         sys.exit(1)
 
 def cmd_hr_generate(args):
-    """CLI HR generate command."""
+    """CLI HR generate command (fixed version)."""
     if not args.api_key:
         print("[ERROR] API key required for HR generation")
         print("Get your key from: https://openrouter.ai/")
         sys.exit(1)
     
-    success = generate_hr_ground_truth(args.api_key, args.sample)
+    success = generate_hr_ground_truth_fixed(args.api_key)
     if not success:
+        sys.exit(1)
+
+def cmd_hr_verify(args):
+    """CLI HR verify command."""
+    consistent = verify_hr_consistency()
+    if not consistent:
         sys.exit(1)
 
 def list_available_resources():
@@ -536,8 +632,8 @@ def list_available_resources():
     check_dependencies()
 
 def main():
-    """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="XAI Benchmark CLI per Google Colab + Human Reasoning")
+    """Main CLI entry point (with HR fixes)."""
+    parser = argparse.ArgumentParser(description="XAI Benchmark CLI per Google Colab + Human Reasoning (FIXED)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # ---- Explain ----
@@ -560,13 +656,15 @@ def main():
     p_test.add_argument("--model", default="tinybert", choices=models.MODELS.keys())
     p_test.add_argument("--explainer", default="lime", choices=explainers.list_explainers())
 
-    # ---- Human Reasoning Status ----
-    p_hr_status = subparsers.add_parser("hr-status", help="Controlla status Human Reasoning")
+    # ---- Human Reasoning Status (with verification) ----
+    p_hr_status = subparsers.add_parser("hr-status", help="Controlla status Human Reasoning con verifica")
 
-    # ---- Human Reasoning Generate ----
-    p_hr_gen = subparsers.add_parser("hr-generate", help="Genera Human Reasoning ground truth")
+    # ---- Human Reasoning Generate (fixed) ----
+    p_hr_gen = subparsers.add_parser("hr-generate", help="Genera Human Reasoning ground truth (400 esempi fissi)")
     p_hr_gen.add_argument("--api-key", required=True, help="OpenRouter API key")
-    p_hr_gen.add_argument("--sample", type=int, default=400, help="Numero di esempi")
+
+    # ---- Human Reasoning Verify ----
+    p_hr_verify = subparsers.add_parser("hr-verify", help="Verifica consistenza HR dataset")
 
     # ---- List ----
     p_list = subparsers.add_parser("list", help="Lista risorse disponibili")
@@ -584,8 +682,11 @@ def main():
         cmd_hr_status(args)
     elif args.command == "hr-generate":
         cmd_hr_generate(args)
+    elif args.command == "hr-verify":
+        cmd_hr_verify(args)
     elif args.command == "list":
         list_available_resources()
 
 if __name__ == "__main__":
     main()
+

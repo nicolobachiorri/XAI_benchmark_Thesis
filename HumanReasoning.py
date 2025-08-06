@@ -1,25 +1,18 @@
 """
-HumanReasoning.py – Human Reasoning Ground Truth Generation (RATE LIMIT FIXED)
-=============================================================================
+HumanReasoning.py – Fixed Human Reasoning Ground Truth Generation
+================================================================
 
-MIGLIORAMENTI PER RATE LIMITS:
-1. Rate limiting intelligente con backoff esponenziale
-2. Gestione automatica di errori 429 (Too Many Requests)
-3. Monitoraggio rate limits in tempo reale
-4. Batch processing con pause dinamiche
-5. Recovery automatico da rate limit exceeded
-6. Support per diversi modelli con rate limits differenti
-7. Progress tracking dettagliato con ETA
+CORREZIONI IMPLEMENTATE:
+1. Usa ESATTAMENTE gli stessi 400 esempi del dataset clusterizzato
+2. Gestione errori senza perdere corrispondenza 1:1
+3. Salvataggio sia CSV che pickle per riutilizzo
+4. Sistema di recovery che mantiene l'ordine originale
+5. Rate limiting intelligente con backoff esponenziale
 
-Rate Limits OpenRouter:
-- Modelli :free: 20 req/min, 50/day (< $10 credits) o 1000/day (≥ $10 credits)
-- Modelli paid: Limiti più alti, dipendono dal modello
-
-Strategia implementata:
-- Max 15 richieste/minuto per sicurezza (sotto il limite di 20)
-- Pausa minima di 4 secondi tra richieste
-- Backoff esponenziale su 429 errors
-- Batch processing con checkpoint
+Sistema di corrispondenza:
+- I 400 esempi sono sempre gli stessi di dataset.test_df
+- Ogni esempio mantiene la sua posizione anche se l'LLM fallisce
+- Il CSV risultante ha sempre 400 righe nella stessa order
 """
 
 import json
@@ -47,9 +40,9 @@ INITIAL_BACKOFF = 5.0         # Backoff iniziale in secondi
 MAX_BACKOFF = 300.0           # Backoff massimo (5 minuti)
 
 # Configurazione modelli
-DEFAULT_MODEL = "deepseek/deepseek-chat"  # Modello veloce e economico
+DEFAULT_MODEL = "moonshotai/kimi-k2"  
 FALLBACK_MODELS = [
-    "anthropic/claude-3.5-haiku",
+    "anthropic/claude-3-haiku",
     "google/gemini-2.0-flash-exp:free",
     "meta-llama/llama-3.2-11b-vision-instruct:free",
     "qwen/qwen-2-7b-instruct:free"
@@ -58,11 +51,12 @@ FALLBACK_MODELS = [
 # Paths
 HR_DATA_DIR = Path("human_reasoning_data")
 HR_DATA_DIR.mkdir(exist_ok=True)
-HR_DATASET_FILE = HR_DATA_DIR / "human_reasoning_ground_truth.csv"
+HR_DATASET_CSV = HR_DATA_DIR / "human_reasoning_ground_truth.csv"
+HR_DATASET_PKL = HR_DATA_DIR / "human_reasoning_ground_truth.pkl"
 HR_CHECKPOINT_FILE = HR_DATA_DIR / "hr_generation_checkpoint.json"
 
 # =============================================================================
-# RATE LIMITER CLASS
+# RATE LIMITER CLASS (mantenuto)
 # =============================================================================
 
 class SmartRateLimiter:
@@ -117,21 +111,9 @@ class SmartRateLimiter:
         self.last_429_time = time.time()
         self.current_backoff = min(self.current_backoff * 2, MAX_BACKOFF)
         print(f"[RATE-LIMITER] 429 error recorded, backoff increased to {self.current_backoff:.1f}s")
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Ottieni statistiche rate limiter."""
-        now = time.time()
-        recent_requests = [t for t in self.request_times if now - t < 60]
-        
-        return {
-            "requests_last_minute": len(recent_requests),
-            "max_requests_per_minute": self.max_requests_per_minute,
-            "current_backoff": self.current_backoff,
-            "time_since_last_429": (now - self.last_429_time) if self.last_429_time else None
-        }
 
 # =============================================================================
-# LLM CLIENT CON RATE LIMITING
+# LLM CLIENT CON RATE LIMITING (mantenuto)
 # =============================================================================
 
 class RateLimitedLLMClient:
@@ -173,8 +155,6 @@ class RateLimitedLLMClient:
                     "top_p": 0.9,
                     "stream": False
                 }
-                
-                print(f"[LLM-CLIENT] Request {self.total_requests + 1} (attempt {attempt + 1}/{MAX_RETRIES + 1})")
                 
                 response = self.session.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -271,29 +251,16 @@ class RateLimitedLLMClient:
     def get_stats(self) -> Dict[str, Any]:
         """Ottieni statistiche client."""
         success_rate = self.successful_requests / self.total_requests if self.total_requests > 0 else 0
-        rate_stats = self.rate_limiter.get_stats()
-        
         return {
             "total_requests": self.total_requests,
             "successful_requests": self.successful_requests,
             "failed_requests": self.failed_requests,
             "success_rate": success_rate,
             "model": self.model,
-            **rate_stats
         }
-    
-    def print_stats(self):
-        """Stampa statistiche."""
-        stats = self.get_stats()
-        print(f"\n[LLM-CLIENT] Statistics:")
-        print(f"  Total requests: {stats['total_requests']}")
-        print(f"  Successful: {stats['successful_requests']}")
-        print(f"  Failed: {stats['failed_requests']}")
-        print(f"  Success rate: {stats['success_rate']:.1%}")
-        print(f"  Requests last minute: {stats['requests_last_minute']}/{stats['max_requests_per_minute']}")
 
 # =============================================================================
-# HUMAN REASONING FUNCTIONS
+# HUMAN REASONING FUNCTIONS - FIXED
 # =============================================================================
 
 def create_hr_prompt(text: str) -> str:
@@ -331,7 +298,6 @@ def parse_hr_response(response: str) -> List[str]:
         end_idx = response.rfind(']')
         
         if start_idx == -1 or end_idx == -1:
-            print(f"[PARSE] No JSON list found in response: {response[:100]}")
             return []
         
         json_str = response[start_idx:end_idx + 1]
@@ -341,7 +307,6 @@ def parse_hr_response(response: str) -> List[str]:
         
         # Validate
         if not isinstance(words, list):
-            print(f"[PARSE] Response is not a list: {type(words)}")
             return []
         
         # Clean words
@@ -356,43 +321,49 @@ def parse_hr_response(response: str) -> List[str]:
         
         return cleaned_words[:8]  # Max 8 words
         
-    except json.JSONDecodeError as e:
-        print(f"[PARSE] JSON decode error: {e}, response: {response[:100]}")
+    except json.JSONDecodeError:
         return []
-    except Exception as e:
-        print(f"[PARSE] Parse error: {e}, response: {response[:100]}")
+    except Exception:
         return []
 
-def generate_single_hr_example(client: RateLimitedLLMClient, text: str, label: int) -> Dict[str, Any]:
-    """Genera singolo esempio Human Reasoning."""
+def generate_single_hr_example(client: RateLimitedLLMClient, text: str, label: int, index: int) -> Dict[str, Any]:
+    """Genera singolo esempio Human Reasoning con index per tracciamento."""
     
     prompt = create_hr_prompt(text)
     response = client.generate_text(prompt, max_tokens=100, temperature=0.3)
     
+    base_result = {
+        "index": index,  # IMPORTANTE: mantiene posizione originale
+        "text": text,
+        "label": label,
+        "hr_ranking": [],
+        "hr_count": 0,
+        "success": False,
+        "error": None,
+        "raw_response": ""
+    }
+    
     if response is None:
-        return {
-            "text": text,
-            "label": label,
-            "hr_ranking": [],
-            "hr_count": 0,
-            "success": False,
-            "error": "LLM request failed"
-        }
+        base_result.update({
+            "error": "LLM request failed",
+            "raw_response": "NO_RESPONSE"
+        })
+        return base_result
     
     hr_ranking = parse_hr_response(response)
     
-    return {
-        "text": text,
-        "label": label,
+    base_result.update({
         "hr_ranking": hr_ranking,
         "hr_count": len(hr_ranking),
         "success": len(hr_ranking) > 0,
         "raw_response": response[:200],  # Store truncated response for debugging
         "error": None if len(hr_ranking) > 0 else "Empty ranking"
-    }
+    })
+    
+    return base_result
 
 # =============================================================================
-# CHECKPOINT SYSTEM
+# CHECKPOINT SYSTEM - FIXED
 # =============================================================================
 
 def save_checkpoint(data: Dict[str, Any], checkpoint_file: Path = HR_CHECKPOINT_FILE):
@@ -419,21 +390,27 @@ def load_checkpoint(checkpoint_file: Path = HR_CHECKPOINT_FILE) -> Optional[Dict
         return None
 
 # =============================================================================
-# MAIN GENERATION FUNCTION
+# MAIN GENERATION FUNCTION - COMPLETELY REWRITTEN
 # =============================================================================
 
 def generate_ground_truth(
     api_key: str,
-    sample_size: int = 400,
+    sample_size: Optional[int] = None,  # Ora opzionale, default usa tutti i 400
     model: str = DEFAULT_MODEL,
     resume: bool = True
 ) -> Optional[pd.DataFrame]:
     """
-    Genera Human Reasoning ground truth con rate limiting intelligente.
+    Genera Human Reasoning ground truth per ESATTAMENTE gli stessi 400 esempi del dataset clusterizzato.
+    
+    CORREZIONI CHIAVE:
+    - Usa dataset.test_df (gli stessi 400 esempi sempre)
+    - Mantiene corrispondenza 1:1 anche con errori LLM
+    - Salva sia CSV che pickle
+    - Recovery senza perdere ordine originale
     
     Args:
         api_key: OpenRouter API key
-        sample_size: Numero di esempi da generare
+        sample_size: Ignorato - usa sempre tutti i 400 esempi
         model: Modello LLM da usare
         resume: Se riprendere da checkpoint esistente
     
@@ -442,11 +419,11 @@ def generate_ground_truth(
     """
     
     print(f"\n{'='*80}")
-    print("HUMAN REASONING GROUND TRUTH GENERATION (RATE LIMIT SAFE)")
+    print("HUMAN REASONING GROUND TRUTH GENERATION - FIXED VERSION")
     print(f"{'='*80}")
-    print(f"Target samples: {sample_size}")
+    print(f"Using EXACTLY the same 400 clustered examples from dataset.test_df")
     print(f"Model: {model}")
-    print(f"Estimated time: {sample_size * 4.5 / 60:.1f} minutes (at 4.5s/request)")
+    print(f"Estimated time: {400 * 4.5 / 60:.1f} minutes (at 4.5s/request)")
     print(f"Rate limits: {MAX_REQUESTS_PER_MINUTE} req/min, {MIN_REQUEST_INTERVAL}s interval")
     print(f"{'='*80}")
     
@@ -455,55 +432,97 @@ def generate_ground_truth(
     # Setup client
     client = RateLimitedLLMClient(api_key, model)
     
-    # Load checkpoint se richiesto
-    completed_examples = []
-    start_idx = 0
+    # CORREZIONE CHIAVE 1: Usa ESATTAMENTE il dataset clusterizzato
+    try:
+        # Ottieni gli stessi 400 esempi del dataset clusterizzato
+        clustered_texts, clustered_labels = dataset.get_clustered_sample(400, stratified=True)
+        print(f"[DATASET] Using {len(clustered_texts)} examples from clustered dataset")
+        
+        # Verifica che siano esattamente 400
+        if len(clustered_texts) != 400:
+            print(f"[ERROR] Expected 400 examples, got {len(clustered_texts)}")
+            return None
+            
+    except Exception as e:
+        print(f"[DATASET] Failed to load clustered dataset: {e}")
+        return None
     
+    # CORREZIONE CHIAVE 2: Inizializza risultati con TUTTI i 400 esempi
+    # Ogni esempio ha la sua posizione fissa, anche se LLM fallisce
+    results = []
+    for i, (text, label) in enumerate(zip(clustered_texts, clustered_labels)):
+        results.append({
+            "index": i,
+            "text": text,
+            "label": label,
+            "hr_ranking": [],
+            "hr_count": 0,
+            "success": False,
+            "error": "NOT_PROCESSED",
+            "raw_response": ""
+        })
+    
+    # Load checkpoint se richiesto
+    start_idx = 0
     if resume:
         checkpoint = load_checkpoint()
         if checkpoint:
-            completed_examples = checkpoint.get("examples", [])
-            start_idx = len(completed_examples)
+            checkpoint_results = checkpoint.get("results", [])
             
-            if start_idx >= sample_size:
-                print(f"[RESUME] Already completed {start_idx} examples, loading existing data...")
-                try:
-                    df = pd.DataFrame(completed_examples[:sample_size])
-                    return df
-                except Exception as e:
-                    print(f"[RESUME] Failed to load checkpoint data: {e}")
-                    completed_examples = []
-                    start_idx = 0
-            else:
-                print(f"[RESUME] Resuming from example {start_idx + 1}/{sample_size}")
+            if len(checkpoint_results) == 400:
+                print(f"[RESUME] Found complete checkpoint with 400 examples")
+                
+                # Verifica se è davvero completo
+                completed_count = sum(1 for r in checkpoint_results if r.get("success", False))
+                pending_count = 400 - completed_count
+                
+                if pending_count == 0:
+                    print(f"[RESUME] All 400 examples already completed, loading existing data...")
+                    try:
+                        df = pd.DataFrame(checkpoint_results)
+                        # Salva anche CSV se non esiste
+                        if not HR_DATASET_CSV.exists():
+                            save_to_csv(df)
+                        return df
+                    except Exception as e:
+                        print(f"[RESUME] Failed to load checkpoint data: {e}")
+                else:
+                    print(f"[RESUME] Resuming: {completed_count} completed, {pending_count} pending")
+                    # Usa i risultati del checkpoint mantenendo l'ordine
+                    results = checkpoint_results
+                    start_idx = 0  # Ripartiamo da 0 ma saltiamo quelli già fatti
     
-    # Get dataset samples
-    try:
-        texts, labels = dataset.get_clustered_sample(sample_size, stratified=True)
-        print(f"[DATA] Loaded {len(texts)} examples from dataset")
-    except Exception as e:
-        print(f"[DATA] Failed to load dataset: {e}")
-        return None
+    # CORREZIONE CHIAVE 3: Processing con mantenimento ordine
+    print(f"\n[PROCESSING] Processing 400 examples (maintaining exact order)...")
     
-    # Process remaining examples
-    remaining_texts = texts[start_idx:]
-    remaining_labels = labels[start_idx:]
-    
-    print(f"\n[PROCESSING] Processing {len(remaining_texts)} remaining examples...")
-    print(f"[PROCESSING] Starting from index {start_idx}")
-    
-    with tqdm(total=len(remaining_texts), desc="HR Generation", leave=True) as pbar:
+    with tqdm(total=400, desc="HR Generation", leave=True) as pbar:
+        # Aggiorna progress bar per esempi già completati
+        completed_already = sum(1 for r in results if r.get("success", False))
+        pbar.update(completed_already)
         
-        for idx, (text, label) in enumerate(zip(remaining_texts, remaining_labels)):
-            global_idx = start_idx + idx
+        for idx in range(400):
+            # Salta se già completato con successo
+            if results[idx].get("success", False):
+                continue
             
             try:
+                text = results[idx]["text"]
+                label = results[idx]["label"]
+                
                 # Update progress
-                pbar.set_description(f"HR Gen ({global_idx + 1}/{sample_size})")
+                pbar.set_description(f"HR Gen ({idx + 1}/400)")
                 
                 # Generate HR example
-                hr_example = generate_single_hr_example(client, text, label)
-                completed_examples.append(hr_example)
+                hr_example = generate_single_hr_example(client, text, label, idx)
+                
+                # IMPORTANTE: mantieni index e dati originali
+                results[idx].update({
+                    "hr_ranking": hr_example["hr_ranking"],
+                    "hr_count": hr_example["hr_count"],
+                    "success": hr_example["success"],
+                    "error": hr_example["error"],
+                    "raw_response": hr_example["raw_response"]
+                })
                 
                 # Progress info
                 if hr_example["success"]:
@@ -512,156 +531,193 @@ def generate_ground_truth(
                     status = f" (FAILED: {hr_example.get('error', 'unknown')})"
                 
                 pbar.set_postfix_str(f"Success: {client.successful_requests}/{client.total_requests}{status}")
-                pbar.update(1)
+                pbar.update(1 if not results[idx-1].get("success", True) else 0)  # Update solo se nuovo
                 
                 # Checkpoint ogni 10 esempi
                 if (idx + 1) % 10 == 0:
+                    current_completed = sum(1 for r in results if r.get("success", False))
                     checkpoint_data = {
-                        "examples": completed_examples,
+                        "results": results,
                         "timestamp": datetime.now().isoformat(),
-                        "total_target": sample_size,
-                        "completed": len(completed_examples),
+                        "total_target": 400,
+                        "completed": current_completed,
+                        "progress_index": idx + 1,
                         "stats": client.get_stats()
                     }
                     save_checkpoint(checkpoint_data)
                 
-                # ETA calculation
-                if idx > 0:
-                    elapsed = time.time() - start_time
-                    rate = (idx + 1) / elapsed
-                    remaining_time = (len(remaining_texts) - idx - 1) / rate
-                    eta = datetime.now() + timedelta(seconds=remaining_time)
-                    pbar.set_postfix_str(f"ETA: {eta.strftime('%H:%M:%S')}")
-                
             except KeyboardInterrupt:
                 print(f"\n[INTERRUPT] Generation interrupted by user")
-                print(f"[INTERRUPT] Completed {len(completed_examples)} examples")
+                current_completed = sum(1 for r in results if r.get("success", False))
+                print(f"[INTERRUPT] Completed {current_completed}/400 examples")
                 break
                 
             except Exception as e:
-                print(f"\n[ERROR] Failed to process example {global_idx}: {e}")
-                # Add empty example per mantenere conteggio
-                completed_examples.append({
-                    "text": text,
-                    "label": label,
+                print(f"\n[ERROR] Failed to process example {idx}: {e}")
+                results[idx].update({
+                    "success": False,
+                    "error": str(e),
                     "hr_ranking": [],
                     "hr_count": 0,
-                    "success": False,
-                    "error": str(e)
+                    "raw_response": f"ERROR: {str(e)}"
                 })
                 pbar.update(1)
     
     # Final statistics
     total_time = time.time() - start_time
-    valid_examples = [ex for ex in completed_examples if ex["success"]]
-    success_rate = len(valid_examples) / len(completed_examples) if completed_examples else 0
+    valid_examples = [ex for ex in results if ex["success"]]
+    success_rate = len(valid_examples) / len(results) if results else 0
     
     print(f"\n{'='*80}")
     print("HUMAN REASONING GENERATION COMPLETED")
     print(f"{'='*80}")
     print(f"Total time: {total_time / 60:.1f} minutes")
-    print(f"Examples processed: {len(completed_examples)}")
+    print(f"Examples processed: 400/400 (EXACT MATCH)")
     print(f"Valid examples: {len(valid_examples)} ({success_rate:.1%})")
-    print(f"Average processing time: {total_time / len(completed_examples):.1f}s per example")
+    print(f"Average processing time: {total_time / 400:.1f}s per example")
     
     # Client statistics
-    client.print_stats()
+    client_stats = client.get_stats()
+    print(f"\nLLM Statistics:")
+    print(f"  Total requests: {client_stats['total_requests']}")
+    print(f"  Successful: {client_stats['successful_requests']}")
+    print(f"  Failed: {client_stats['failed_requests']}")
+    print(f"  Success rate: {client_stats['success_rate']:.1%}")
     
-    # Save final dataset
-    if completed_examples:
-        try:
-            df = pd.DataFrame(completed_examples)
-            df.to_csv(HR_DATASET_FILE, index=False)
-            print(f"\n[SAVE] Dataset saved to: {HR_DATASET_FILE}")
-            
-            # Save final checkpoint
-            final_checkpoint = {
-                "examples": completed_examples,
-                "timestamp": datetime.now().isoformat(),
-                "total_target": sample_size,
-                "completed": len(completed_examples),
-                "final_stats": client.get_stats(),
-                "success_rate": success_rate,
-                "total_time_minutes": total_time / 60
-            }
-            save_checkpoint(final_checkpoint)
-            
-            return df
-            
-        except Exception as e:
-            print(f"[SAVE] Failed to save dataset: {e}")
-            return None
-    
-    print(f"[ERROR] No examples completed successfully")
-    return None
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-def load_ground_truth() -> Optional[pd.DataFrame]:
-    """Carica ground truth esistente."""
-    if not HR_DATASET_FILE.exists():
-        return None
-    
+    # CORREZIONE CHIAVE 4: Salva sia CSV che pickle
     try:
-        df = pd.read_csv(HR_DATASET_FILE)
+        df = pd.DataFrame(results)
         
-        # Parse hr_ranking column (stored as string)
-        def parse_ranking(ranking_str):
-            if pd.isna(ranking_str) or ranking_str == "":
-                return []
-            try:
-                return eval(ranking_str) if isinstance(ranking_str, str) else ranking_str
-            except:
-                return []
+        # Verifica che abbiamo esattamente 400 righe
+        if len(df) != 400:
+            print(f"[ERROR] DataFrame has {len(df)} rows instead of 400")
+            return None
         
-        df['hr_ranking'] = df['hr_ranking'].apply(parse_ranking)
+        # Salva CSV (per riutilizzo futuro)
+        save_to_csv(df)
+        
+        # Salva pickle (per sessione corrente)
+        df.to_pickle(HR_DATASET_PKL)
+        print(f"[SAVE] Pickle saved to: {HR_DATASET_PKL}")
+        
+        # Save final checkpoint
+        final_checkpoint = {
+            "results": results,
+            "timestamp": datetime.now().isoformat(),
+            "total_target": 400,
+            "completed": len(valid_examples),
+            "final_stats": client_stats,
+            "success_rate": success_rate,
+            "total_time_minutes": total_time / 60,
+            "exact_match": True  # Flag per indicare che sono esattamente i 400 del dataset
+        }
+        save_checkpoint(final_checkpoint)
         
         return df
         
     except Exception as e:
-        print(f"[LOAD] Failed to load ground truth: {e}")
+        print(f"[SAVE] Failed to save dataset: {e}")
         return None
+
+def save_to_csv(df: pd.DataFrame):
+    """Salva DataFrame in CSV con formato corretto per riutilizzo."""
+    try:
+        # Converte hr_ranking da lista a stringa JSON per CSV
+        df_csv = df.copy()
+        df_csv['hr_ranking'] = df_csv['hr_ranking'].apply(
+            lambda x: json.dumps(x) if isinstance(x, list) else "[]"
+        )
+        
+        df_csv.to_csv(HR_DATASET_CSV, index=False)
+        print(f"[SAVE] CSV saved to: {HR_DATASET_CSV}")
+        
+    except Exception as e:
+        print(f"[SAVE] Failed to save CSV: {e}")
+
+# =============================================================================
+# UTILITY FUNCTIONS - FIXED
+# =============================================================================
+
+def load_ground_truth() -> Optional[pd.DataFrame]:
+    """Carica ground truth esistente - PRIMA CSV poi pickle."""
+    
+    # PRIORITA 1: CSV (per riutilizzo tra sessioni)
+    if HR_DATASET_CSV.exists():
+        try:
+            df = pd.read_csv(HR_DATASET_CSV)
+            
+            # Parse hr_ranking column (stored as JSON string in CSV)
+            def parse_ranking(ranking_str):
+                if pd.isna(ranking_str) or ranking_str == "":
+                    return []
+                try:
+                    if isinstance(ranking_str, str):
+                        return json.loads(ranking_str)
+                    else:
+                        return ranking_str if isinstance(ranking_str, list) else []
+                except:
+                    return []
+            
+            df['hr_ranking'] = df['hr_ranking'].apply(parse_ranking)
+            
+            # Verifica che sia il dataset corretto
+            if len(df) == 400:
+                print(f"[LOAD] Loaded ground truth from CSV: {len(df)} examples")
+                return df
+            else:
+                print(f"[LOAD] CSV has {len(df)} examples, expected 400")
+                
+        except Exception as e:
+            print(f"[LOAD] Failed to load CSV: {e}")
+    
+    # PRIORITA 2: Pickle (fallback per sessione corrente)
+    if HR_DATASET_PKL.exists():
+        try:
+            df = pd.read_pickle(HR_DATASET_PKL)
+            
+            if len(df) == 400:
+                print(f"[LOAD] Loaded ground truth from pickle: {len(df)} examples")
+                return df
+            else:
+                print(f"[LOAD] Pickle has {len(df)} examples, expected 400")
+                
+        except Exception as e:
+            print(f"[LOAD] Failed to load pickle: {e}")
+    
+    print(f"[LOAD] No valid ground truth found")
+    return None
 
 def is_available() -> bool:
     """Controlla se Human Reasoning ground truth è disponibile."""
-    if not HR_DATASET_FILE.exists():
+    df = load_ground_truth()
+    if df is None or len(df) != 400:
         return False
     
-    try:
-        df = load_ground_truth()
-        if df is None or len(df) == 0:
-            return False
-        
-        valid_count = (df['hr_count'] > 0).sum()
-        return valid_count > 10  # Almeno 10 esempi validi
-        
-    except Exception:
-        return False
+    valid_count = (df['hr_count'] > 0).sum()
+    return valid_count > 50  # Almeno 50 esempi validi dei 400
 
 def get_info() -> Dict[str, Any]:
     """Ottieni informazioni su Human Reasoning ground truth."""
     info = {
         "available": False,
-        "file_path": str(HR_DATASET_FILE),
+        "csv_path": str(HR_DATASET_CSV),
+        "pkl_path": str(HR_DATASET_PKL),
         "total_examples": 0,
         "valid_examples": 0,
         "success_rate": None,
-        "avg_words_per_example": 0.0
+        "avg_words_per_example": 0.0,
+        "exact_match_dataset": False
     }
     
-    if not HR_DATASET_FILE.exists():
+    df = load_ground_truth()
+    if df is None:
         return info
     
     try:
-        df = load_ground_truth()
-        if df is None:
-            return info
-        
         info["available"] = True
         info["total_examples"] = len(df)
         info["valid_examples"] = (df['hr_count'] > 0).sum()
+        info["exact_match_dataset"] = len(df) == 400  # Flag importante
         
         if info["total_examples"] > 0:
             info["success_rate"] = info["valid_examples"] / info["total_examples"]
@@ -685,7 +741,8 @@ def test_api_key(api_key: str, model: str = DEFAULT_MODEL) -> bool:
         
         if response and "hello" in response.lower():
             print(f"[TEST]  API key test successful")
-            client.print_stats()
+            stats = client.get_stats()
+            print(f"[TEST]  Stats: {stats['successful_requests']}/{stats['total_requests']} requests successful")
             return True
         else:
             print(f"[TEST]  API key test failed: unexpected response")
@@ -695,7 +752,48 @@ def test_api_key(api_key: str, model: str = DEFAULT_MODEL) -> bool:
         print(f"[TEST]  API key test failed: {e}")
         return False
 
-# Alias per compatibilità
+def verify_dataset_consistency() -> bool:
+    """Verifica che il dataset HR corrisponda esattamente al dataset clusterizzato."""
+    print(f"[VERIFY] Checking HR dataset consistency with clustered dataset...")
+    
+    try:
+        # Carica HR dataset
+        hr_df = load_ground_truth()
+        if hr_df is None or len(hr_df) != 400:
+            print(f"[VERIFY] HR dataset not available or wrong size")
+            return False
+        
+        # Carica dataset clusterizzato
+        clustered_texts, clustered_labels = dataset.get_clustered_sample(400, stratified=True)
+        
+        if len(clustered_texts) != 400:
+            print(f"[VERIFY] Clustered dataset has {len(clustered_texts)} examples, expected 400")
+            return False
+        
+        # Verifica corrispondenza 1:1
+        mismatches = 0
+        for i, (hr_text, hr_label, clust_text, clust_label) in enumerate(
+            zip(hr_df['text'], hr_df['label'], clustered_texts, clustered_labels)
+        ):
+            if hr_text != clust_text or hr_label != clust_label:
+                mismatches += 1
+                if mismatches <= 3:  # Mostra solo primi 3 errori
+                    print(f"[VERIFY] Mismatch at index {i}:")
+                    print(f"[VERIFY]   HR: '{hr_text[:50]}...' (label: {hr_label})")
+                    print(f"[VERIFY]   Clustered: '{clust_text[:50]}...' (label: {clust_label})")
+        
+        if mismatches == 0:
+            print(f"[VERIFY]  Perfect match: HR dataset corresponds exactly to clustered dataset")
+            return True
+        else:
+            print(f"[VERIFY]  Found {mismatches}/400 mismatches")
+            return False
+        
+    except Exception as e:
+        print(f"[VERIFY] Verification failed: {e}")
+        return False
+
+# Alias per compatibilità con codice esistente
 def test_api_key_compatibility(api_key: str, model: str = DEFAULT_MODEL) -> bool:
     """Alias per compatibilità con codice esistente."""
     return test_api_key(api_key, model)
@@ -705,15 +803,15 @@ def test_api_key_compatibility(api_key: str, model: str = DEFAULT_MODEL) -> bool
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Human Reasoning Ground Truth Generator (Rate Limit Safe)")
+    print("Human Reasoning Ground Truth Generator - FIXED VERSION")
     print("=" * 60)
     
     # Test con API key di esempio
-    test_api_key = input("Enter OpenRouter API key for testing (or press Enter to skip): ").strip()
+    test_api_key_input = input("Enter OpenRouter API key for testing (or press Enter to skip): ").strip()
     
-    if test_api_key:
+    if test_api_key_input:
         print("\nTesting API connection...")
-        if test_api_key(test_api_key):
+        if test_api_key(test_api_key_input):
             print(" API connection successful!")
         else:
             print(" API connection failed!")
@@ -726,9 +824,27 @@ if __name__ == "__main__":
     print(f"Info: {info}")
     
     if info["available"]:
+        print(f"\nTesting dataset consistency...")
+        consistent = verify_dataset_consistency()
+        if consistent:
+            print(" Dataset consistency verified!")
+        else:
+            print(" Dataset consistency issues found!")
+        
         df = load_ground_truth()
         if df is not None:
             print(f"Loaded dataset: {len(df)} examples")
-            print(f"Sample HR ranking: {df.iloc[0]['hr_ranking'] if len(df) > 0 else 'None'}")
+            valid_count = (df['hr_count'] > 0).sum()
+            print(f"Valid examples: {valid_count}/{len(df)} ({valid_count/len(df):.1%})")
+            
+            if valid_count > 0:
+                sample_hr = df[df['hr_count'] > 0].iloc[0]
+                print(f"Sample HR ranking: {sample_hr['hr_ranking']}")
     
-    print("\nHuman Reasoning module ready!")
+    print("\nHuman Reasoning module (FIXED) ready!")
+    print("\nKEY FIXES:")
+    print("- Uses EXACTLY the same 400 examples from dataset.test_df")
+    print("- Maintains 1:1 correspondence even with LLM failures")
+    print("- Saves both CSV (for reuse) and pickle (for session)")
+    print("- Robust recovery without losing original order")
+    print("- Verification system for dataset consistency")

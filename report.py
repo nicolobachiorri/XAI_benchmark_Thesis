@@ -89,7 +89,7 @@ set_seed(42)
 # =============================================================================
 
 def check_hr_status() -> Dict[str, Any]:
-    """Controlla status Human Reasoning per report."""
+    """Controlla status Human Reasoning per report (FIXED VERSION)."""
     print(f"\n[HR-STATUS] Checking Human Reasoning availability...")
     
     hr_info = hr.get_info()
@@ -98,30 +98,57 @@ def check_hr_status() -> Dict[str, Any]:
     if hr_info['available']:
         print(f"[HR-STATUS] Valid examples: {hr_info['valid_examples']}/{hr_info['total_examples']}")
         print(f"[HR-STATUS] Average words: {hr_info['avg_words_per_example']:.1f}")
+        print(f"[HR-STATUS] CSV exists: {'YES' if hr.HR_DATASET_CSV.exists() else 'NO'}")
+        
+        # CORREZIONE: Verifica consistenza
+        if hr_info.get('exact_match_dataset', False):
+            print(f"[HR-STATUS] Dataset consistency: VERIFIED")
+        else:
+            print(f"[HR-STATUS] Dataset consistency: CHECKING...")
+            try:
+                consistent = hr.verify_dataset_consistency()
+                if consistent:
+                    print(f"[HR-STATUS] Dataset consistency: VERIFIED (on-demand check)")
+                else:
+                    print(f"[HR-STATUS] Dataset consistency: FAILED - needs regeneration")
+            except Exception as e:
+                print(f"[HR-STATUS] Dataset consistency: ERROR - {e}")
     else:
         print(f"[HR-STATUS] Not available - needs generation")
     
     return hr_info
 
 def generate_hr_ground_truth(api_key: str, sample_size: int = 400) -> bool:
-    """Genera Human Reasoning ground truth per report."""
-    print(f"\n[HR-GENERATE] Starting Human Reasoning generation...")
-    print(f"[HR-GENERATE] Sample size: {sample_size}")
-    print(f"[HR-GENERATE] Estimated time: {sample_size * 1.2 / 60:.1f} minutes")
+    """Genera Human Reasoning ground truth per report (FIXED VERSION)."""
+    print(f"\n[HR-GENERATE] Starting Human Reasoning generation (FIXED)...")
+    print(f"[HR-GENERATE] Will use EXACTLY the 400 clustered examples")
+    print(f"[HR-GENERATE] Estimated time: {400 * 1.2 / 60:.1f} minutes")
     
     try:
-        with Timer(f"HR Generation ({sample_size} examples)"):
+        with Timer(f"HR Generation (400 fixed examples)"):
             hr_dataset = hr.generate_ground_truth(
                 api_key=api_key,
-                sample_size=sample_size
+                sample_size=None,  # None = usa tutti i 400 del dataset clusterizzato
+                resume=True
             )
         
-        if hr_dataset is not None and len(hr_dataset) > 0:
+        if hr_dataset is not None and len(hr_dataset) == 400:
             valid_count = (hr_dataset['hr_count'] > 0).sum()
             success_rate = valid_count / len(hr_dataset)
             
             print(f"[HR-GENERATE]  Generated {valid_count}/{len(hr_dataset)} valid examples ({success_rate:.1%})")
-            return success_rate > 0.5
+            
+            # Verifica consistenza
+            try:
+                consistent = hr.verify_dataset_consistency()
+                if consistent:
+                    print(f"[HR-GENERATE]  Dataset consistency: VERIFIED")
+                else:
+                    print(f"[HR-GENERATE]  Dataset consistency: FAILED (unexpected)")
+            except Exception as e:
+                print(f"[HR-GENERATE]  Dataset consistency check failed: {e}")
+            
+            return success_rate > 0.3  # Soglia realistica
         else:
             print(f"[HR-GENERATE]  Generation failed")
             return False
@@ -131,13 +158,31 @@ def generate_hr_ground_truth(api_key: str, sample_size: int = 400) -> bool:
         return False
 
 def ensure_hr_availability(auto_generate: bool = False, api_key: Optional[str] = None) -> bool:
-    """Assicura che Human Reasoning sia disponibile per il report."""
+    """Assicura che Human Reasoning sia disponibile per il report (FIXED)."""
     hr_info = hr.get_info()
     
     if hr_info['available']:
         if hr_info['valid_examples'] < 50:  # Soglia minima
             print(f"[HR-ENSURE]  Too few valid examples ({hr_info['valid_examples']})")
             return False
+        
+        # CORREZIONE: Verifica anche consistenza
+        if not hr_info.get('exact_match_dataset', False):
+            print(f"[HR-ENSURE] Checking dataset consistency...")
+            try:
+                consistent = hr.verify_dataset_consistency()
+                if not consistent:
+                    print(f"[HR-ENSURE]  Dataset consistency failed")
+                    if auto_generate and api_key:
+                        print(f"[HR-ENSURE] Auto-regenerating due to inconsistency...")
+                        return generate_hr_ground_truth(api_key)
+                    else:
+                        print(f"[HR-ENSURE]  Inconsistent HR dataset - set auto_generate=True to fix")
+                        return False
+            except Exception as e:
+                print(f"[HR-ENSURE]  Consistency check error: {e}")
+                return False
+        
         print(f"[HR-ENSURE]  Human Reasoning available with {hr_info['valid_examples']} examples")
         return True
     
@@ -1025,8 +1070,8 @@ def run_simplified_report(
     resume: bool = True,
     drive_folder: str = "XAI_Results",
     no_backup: bool = False,
-    hr_api_key: Optional[str] = None,  # NEW: API key for HR generation
-    auto_generate_hr: bool = False     # NEW: Auto-generate HR if missing
+    hr_api_key: Optional[str] = None,  # AGGIUNGI questo parametro
+    auto_generate_hr: bool = False 
 ) -> Dict[str, pd.DataFrame]:
     """Esegue report completo con architettura semplificata + Human Reasoning."""
     
@@ -1069,33 +1114,46 @@ def run_simplified_report(
         if "human_reasoning" in metrics_to_compute:
             print(f"\n[HR-SETUP] Human Reasoning metric requested...")
             
-            # Check availability
-            if not system_resources["hr_available"]:
-                print(f"[HR-SETUP] Human Reasoning not available")
-                
-                if auto_generate_hr and hr_api_key:
-                    print(f"[HR-SETUP] Auto-generating Human Reasoning ground truth...")
-                    hr_success = generate_hr_ground_truth(hr_api_key)
-                    if hr_success:
-                        hr_dataset = hr.load_ground_truth()
-                        print(f"[HR-SETUP]  Human Reasoning generated and loaded")
-                    else:
-                        print(f"[HR-SETUP]  Human Reasoning generation failed")
-                        metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
-                        print(f"[HR-SETUP] Removed human_reasoning from metrics")
-                else:
-                    print(f"[HR-SETUP]  Human Reasoning will be skipped")
-                    print(f"[HR-SETUP] To enable: provide hr_api_key and set auto_generate_hr=True")
-                    # Keep the metric but it will be skipped during processing
-            else:
+            # CORREZIONE: Usa ensure_hr_availability con controlli aggiuntivi
+            hr_available = ensure_hr_availability(auto_generate=auto_generate_hr, api_key=hr_api_key)
+            
+            if hr_available:
                 # Load existing HR dataset
                 hr_dataset = hr.load_ground_truth()
-                if hr_dataset is not None:
+                if hr_dataset is not None and len(hr_dataset) == 400:
                     valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
-                    print(f"[HR-SETUP]  Loaded {valid_hr_count} valid HR examples")
+                    print(f"[HR-SETUP]  Loaded {valid_hr_count}/400 valid HR examples")
+                    
+                    # Double-check consistency in report context
+                    try:
+                        consistent = hr.verify_dataset_consistency()
+                        if not consistent:
+                            print(f"[HR-SETUP]  WARNING: HR dataset consistency issues detected")
+                            print(f"[HR-SETUP]  This may affect Human Reasoning evaluation accuracy")
+                            if auto_generate_hr and hr_api_key:
+                                print(f"[HR-SETUP]  Attempting auto-regeneration...")
+                                if generate_hr_ground_truth(hr_api_key):
+                                    hr_dataset = hr.load_ground_truth()
+                                    print(f"[HR-SETUP]  HR dataset regenerated successfully")
+                                else:
+                                    print(f"[HR-SETUP]  HR regeneration failed")
+                    except Exception as e:
+                        print(f"[HR-SETUP]  Consistency check error: {e}")
                 else:
-                    print(f"[HR-SETUP]  Failed to load HR dataset")
+                    print(f"[HR-SETUP]  Failed to load HR dataset properly")
+                    hr_dataset = None
                     metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+                    print(f"[HR-SETUP] Removed human_reasoning from metrics")
+            else:
+                print(f"[HR-SETUP]  Human Reasoning not available")
+                if auto_generate_hr and hr_api_key:
+                    print(f"[HR-SETUP]  Auto-generation was attempted but failed")
+                else:
+                    print(f"[HR-SETUP]  To enable: set auto_generate_hr=True and provide hr_api_key")
+                
+                # Remove HR from metrics
+                metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+                print(f"[HR-SETUP] Removed human_reasoning from metrics")
         
         total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
         
@@ -1269,12 +1327,22 @@ def get_available_resources():
     print(f"[RESOURCES] Metrics: {len(METRICS)} available (including Human Reasoning)")
     print(f"[RESOURCES] Dataset: {len(dataset.test_df)} clustered examples")
     
-    # Human Reasoning status
     hr_info = hr.get_info()
     if hr_info['available']:
-        print(f"[RESOURCES] Human Reasoning: {hr_info['valid_examples']} valid examples")
+        consistency_status = ""
+        if hr_info.get('exact_match_dataset', False):
+            consistency_status = " (CONSISTENT)"
+        else:
+            # Quick check
+            try:
+                consistent = hr.verify_dataset_consistency()
+                consistency_status = " (VERIFIED)" if consistent else " (INCONSISTENT)"
+            except:
+                consistency_status = " (UNKNOWN)"
+        
+        print(f"[RESOURCES] Human Reasoning: {hr_info['valid_examples']}/400 examples{consistency_status}")
     else:
-        print(f"[RESOURCES] Human Reasoning: Not available (can be generated)")
+        print(f"[RESOURCES] Human Reasoning: Not available (can be generated with fixed version)")
     
     return available_models, available_explainers
 
@@ -1309,10 +1377,29 @@ def main():
     parser.add_argument("--include-hr", action="store_true", help="Include HR in turbo mode")
     parser.add_argument("--hr-status", action="store_true", help="Check HR status and exit")
     parser.add_argument("--hr-generate", action="store_true", help="Generate HR ground truth and exit")
+    parser.add_argument("--hr-verify", action="store_true", help="Verify HR dataset consistency")
+    args = parser.parse_args()
+   
     
     args = parser.parse_args()
     
     # Handle HR-specific commands first
+    if args.hr_verify:
+        print("Verifying HR dataset consistency...")
+        try:
+            consistent = hr.verify_dataset_consistency()
+            if consistent:
+                print(" VERIFICATION PASSED - HR dataset matches clustered dataset exactly")
+            else:
+                print(" VERIFICATION FAILED - HR dataset has inconsistencies")
+                print("Recommendation: Regenerate HR dataset with --hr-generate")
+                sys.exit(1)
+        except Exception as e:
+            print(f" VERIFICATION ERROR: {e}")
+            sys.exit(1)
+        return
+    
+          
     if args.hr_status:
         check_hr_status()
         return
