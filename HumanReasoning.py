@@ -1,18 +1,16 @@
 """
-HumanReasoning.py – Fixed Human Reasoning Ground Truth Generation
-================================================================
+HumanReasoning.py – Fixed Human Reasoning Ground Truth Generation (COMPLETE)
+=============================================================================
 
 CORREZIONI IMPLEMENTATE:
 1. Usa ESATTAMENTE gli stessi 400 esempi del dataset clusterizzato
 2. Gestione errori senza perdere corrispondenza 1:1
 3. Salvataggio sia CSV che pickle per riutilizzo
 4. Sistema di recovery che mantiene l'ordine originale
-5. Rate limiting intelligente con backoff esponenziale
-
-Sistema di corrispondenza:
-- I 400 esempi sono sempre gli stessi di dataset.test_df
-- Ogni esempio mantiene la sua posizione anche se l'LLM fallisce
-- Il CSV risultante ha sempre 400 righe nella stessa order
+5. Progress bar funzionante correttamente
+6. Rate limiting ottimizzato e adattivo
+7. Checkpoint ogni 10 esempi (non ogni esempio)
+8. ETA accurato e statistiche migliori
 """
 
 import json
@@ -40,9 +38,10 @@ INITIAL_BACKOFF = 5.0         # Backoff iniziale in secondi
 MAX_BACKOFF = 300.0           # Backoff massimo (5 minuti)
 
 # Configurazione modelli
-DEFAULT_MODEL = "moonshotai/kimi-k2"  
+DEFAULT_MODEL = "moonshotai/kimi-k2" 
 FALLBACK_MODELS = [
     "anthropic/claude-3-haiku",
+    "deepseek/deepseek-chat",
     "google/gemini-2.0-flash-exp:free",
     "meta-llama/llama-3.2-11b-vision-instruct:free",
     "qwen/qwen-2-7b-instruct:free"
@@ -56,11 +55,11 @@ HR_DATASET_PKL = HR_DATA_DIR / "human_reasoning_ground_truth.pkl"
 HR_CHECKPOINT_FILE = HR_DATA_DIR / "hr_generation_checkpoint.json"
 
 # =============================================================================
-# RATE LIMITER CLASS (mantenuto)
+# RATE LIMITER CLASS - OTTIMIZZATO
 # =============================================================================
 
 class SmartRateLimiter:
-    """Rate limiter intelligente con backoff esponenziale."""
+    """Rate limiter intelligente con backoff esponenziale e interval adattivo."""
     
     def __init__(self, max_requests_per_minute: int = MAX_REQUESTS_PER_MINUTE):
         self.max_requests_per_minute = max_requests_per_minute
@@ -68,11 +67,12 @@ class SmartRateLimiter:
         self.request_times = []
         self.last_429_time = None
         self.current_backoff = INITIAL_BACKOFF
+        self.adaptive_interval = self.min_interval  # CORREZIONE: Interval adattivo
         
-        print(f"[RATE-LIMITER] Initialized: {max_requests_per_minute} req/min, {self.min_interval:.1f}s interval")
+        print(f"[RATE-LIMITER] Initialized: {max_requests_per_minute} req/min, {self.min_interval:.1f}s base interval")
     
     def wait_if_needed(self):
-        """Aspetta se necessario prima della prossima richiesta."""
+        """Aspetta se necessario con interval adattivo."""
         now = time.time()
         
         # Rimuovi richieste vecchie (più di 1 minuto)
@@ -81,18 +81,18 @@ class SmartRateLimiter:
         # Se abbiamo raggiunto il limite, aspetta
         if len(self.request_times) >= self.max_requests_per_minute:
             oldest_request = min(self.request_times)
-            wait_time = 60 - (now - oldest_request) + 1  # +1 per sicurezza
+            wait_time = 60 - (now - oldest_request) + 0.5  # Ridotto +0.5 invece di +1
             if wait_time > 0:
                 print(f"[RATE-LIMITER] Rate limit reached, waiting {wait_time:.1f}s...")
                 time.sleep(wait_time)
         
-        # Aspetta intervallo minimo dall'ultima richiesta
+        # CORREZIONE: Interval adattivo invece di fisso
         if self.request_times:
             last_request = max(self.request_times)
             time_since_last = now - last_request
-            if time_since_last < self.min_interval:
-                wait_time = self.min_interval - time_since_last
-                time.sleep(wait_time)
+            wait_needed = self.adaptive_interval - time_since_last
+            if wait_needed > 0:
+                time.sleep(wait_needed)
         
         # Se recente 429, aspetta backoff
         if self.last_429_time and (now - self.last_429_time) < self.current_backoff:
@@ -101,19 +101,40 @@ class SmartRateLimiter:
             time.sleep(remaining_backoff)
     
     def record_request(self):
-        """Registra una richiesta riuscita."""
+        """Registra richiesta riuscita e adatta interval."""
         self.request_times.append(time.time())
+        
+        # CORREZIONE: Interval adattivo - riduci se va tutto bene
+        if len(self.request_times) >= 5:  # Dopo 5 richieste di successo
+            recent_interval = (max(self.request_times) - min(self.request_times[-5:])) / 4
+            if recent_interval < self.min_interval * 1.5:  # Se stiamo andando bene
+                self.adaptive_interval = max(self.min_interval * 0.8, 2.0)  # Riduci ma non sotto 2s
+        
         # Reset backoff su successo
         self.current_backoff = INITIAL_BACKOFF
     
     def record_429_error(self):
-        """Registra un errore 429 e aumenta backoff."""
+        """Registra errore 429 e aumenta backoff e interval."""
         self.last_429_time = time.time()
         self.current_backoff = min(self.current_backoff * 2, MAX_BACKOFF)
-        print(f"[RATE-LIMITER] 429 error recorded, backoff increased to {self.current_backoff:.1f}s")
+        self.adaptive_interval = min(self.adaptive_interval * 1.5, 10.0)  # Aumenta interval
+        print(f"[RATE-LIMITER] 429 error: backoff={self.current_backoff:.1f}s, interval={self.adaptive_interval:.1f}s")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Ottieni statistiche rate limiter."""
+        now = time.time()
+        recent_requests = [t for t in self.request_times if now - t < 60]
+        
+        return {
+            "requests_last_minute": len(recent_requests),
+            "max_requests_per_minute": self.max_requests_per_minute,
+            "current_backoff": self.current_backoff,
+            "adaptive_interval": self.adaptive_interval,
+            "time_since_last_429": (now - self.last_429_time) if self.last_429_time else None
+        }
 
 # =============================================================================
-# LLM CLIENT CON RATE LIMITING (mantenuto)
+# LLM CLIENT CON RATE LIMITING
 # =============================================================================
 
 class RateLimitedLLMClient:
@@ -132,8 +153,8 @@ class RateLimitedLLMClient:
         self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/your-repo",  # Opzionale per tracking
-            "X-Title": "XAI Human Reasoning Ground Truth"    # Opzionale per tracking
+            "HTTP-Referer": "https://github.com/your-repo",
+            "X-Title": "XAI Human Reasoning Ground Truth"
         })
         
         print(f"[LLM-CLIENT] Initialized with model: {model}")
@@ -183,7 +204,7 @@ class RateLimitedLLMClient:
                     self.failed_requests += 1
                     print(f"[LLM-CLIENT] HTTP error {response.status_code}: {response.text[:200]}")
                     if attempt < MAX_RETRIES:
-                        time.sleep(2 ** attempt)  # Backoff semplice
+                        time.sleep(2 ** attempt)
                         continue
                     return None
                 
@@ -251,16 +272,29 @@ class RateLimitedLLMClient:
     def get_stats(self) -> Dict[str, Any]:
         """Ottieni statistiche client."""
         success_rate = self.successful_requests / self.total_requests if self.total_requests > 0 else 0
+        rate_stats = self.rate_limiter.get_stats()
+        
         return {
             "total_requests": self.total_requests,
             "successful_requests": self.successful_requests,
             "failed_requests": self.failed_requests,
             "success_rate": success_rate,
             "model": self.model,
+            **rate_stats
         }
+    
+    def print_stats(self):
+        """Stampa statistiche."""
+        stats = self.get_stats()
+        print(f"\n[LLM-CLIENT] Statistics:")
+        print(f"  Total requests: {stats['total_requests']}")
+        print(f"  Successful: {stats['successful_requests']}")
+        print(f"  Failed: {stats['failed_requests']}")
+        print(f"  Success rate: {stats['success_rate']:.1%}")
+        print(f"  Requests last minute: {stats['requests_last_minute']}/{stats['max_requests_per_minute']}")
 
 # =============================================================================
-# HUMAN REASONING FUNCTIONS - FIXED
+# HUMAN REASONING FUNCTIONS
 # =============================================================================
 
 def create_hr_prompt(text: str) -> str:
@@ -333,7 +367,7 @@ def generate_single_hr_example(client: RateLimitedLLMClient, text: str, label: i
     response = client.generate_text(prompt, max_tokens=100, temperature=0.3)
     
     base_result = {
-        "index": index,  # IMPORTANTE: mantiene posizione originale
+        "index": index,
         "text": text,
         "label": label,
         "hr_ranking": [],
@@ -356,14 +390,14 @@ def generate_single_hr_example(client: RateLimitedLLMClient, text: str, label: i
         "hr_ranking": hr_ranking,
         "hr_count": len(hr_ranking),
         "success": len(hr_ranking) > 0,
-        "raw_response": response[:200],  # Store truncated response for debugging
+        "raw_response": response[:200],
         "error": None if len(hr_ranking) > 0 else "Empty ranking"
     })
     
     return base_result
 
 # =============================================================================
-# CHECKPOINT SYSTEM - FIXED
+# CHECKPOINT SYSTEM
 # =============================================================================
 
 def save_checkpoint(data: Dict[str, Any], checkpoint_file: Path = HR_CHECKPOINT_FILE):
@@ -371,7 +405,7 @@ def save_checkpoint(data: Dict[str, Any], checkpoint_file: Path = HR_CHECKPOINT_
     try:
         with open(checkpoint_file, 'w') as f:
             json.dump(data, f, indent=2, default=str)
-        print(f"[CHECKPOINT] Saved to {checkpoint_file}")
+        # print(f"[CHECKPOINT] Saved to {checkpoint_file}")  # Meno verbose
     except Exception as e:
         print(f"[CHECKPOINT] Save failed: {e}")
 
@@ -390,23 +424,24 @@ def load_checkpoint(checkpoint_file: Path = HR_CHECKPOINT_FILE) -> Optional[Dict
         return None
 
 # =============================================================================
-# MAIN GENERATION FUNCTION - COMPLETELY REWRITTEN
+# MAIN GENERATION FUNCTION - COMPLETELY REWRITTEN WITH FIXES
 # =============================================================================
 
 def generate_ground_truth(
     api_key: str,
-    sample_size: Optional[int] = None,  # Ora opzionale, default usa tutti i 400
+    sample_size: Optional[int] = None,
     model: str = DEFAULT_MODEL,
     resume: bool = True
 ) -> Optional[pd.DataFrame]:
     """
     Genera Human Reasoning ground truth per ESATTAMENTE gli stessi 400 esempi del dataset clusterizzato.
     
-    CORREZIONI CHIAVE:
-    - Usa dataset.test_df (gli stessi 400 esempi sempre)
-    - Mantiene corrispondenza 1:1 anche con errori LLM
-    - Salva sia CSV che pickle
-    - Recovery senza perdere ordine originale
+    CORREZIONI IMPLEMENTATE:
+    - Progress bar funzionante correttamente
+    - Checkpoint ogni 10 esempi processati (non ogni esempio)
+    - Rate limiting ottimizzato e adattivo
+    - ETA accurato basato sui processamenti reali
+    - Statistiche migliori con debug info
     
     Args:
         api_key: OpenRouter API key
@@ -423,7 +458,7 @@ def generate_ground_truth(
     print(f"{'='*80}")
     print(f"Using EXACTLY the same 400 clustered examples from dataset.test_df")
     print(f"Model: {model}")
-    print(f"Estimated time: {400 * 4.5 / 60:.1f} minutes (at 4.5s/request)")
+    print(f"Estimated time: {400 * 6.0 / 60:.1f} minutes (at 6s/request - more realistic)")
     print(f"Rate limits: {MAX_REQUESTS_PER_MINUTE} req/min, {MIN_REQUEST_INTERVAL}s interval")
     print(f"{'='*80}")
     
@@ -434,11 +469,9 @@ def generate_ground_truth(
     
     # CORREZIONE CHIAVE 1: Usa ESATTAMENTE il dataset clusterizzato
     try:
-        # Ottieni gli stessi 400 esempi del dataset clusterizzato
         clustered_texts, clustered_labels = dataset.get_clustered_sample(400, stratified=True)
         print(f"[DATASET] Using {len(clustered_texts)} examples from clustered dataset")
         
-        # Verifica che siano esattamente 400
         if len(clustered_texts) != 400:
             print(f"[ERROR] Expected 400 examples, got {len(clustered_texts)}")
             return None
@@ -448,7 +481,6 @@ def generate_ground_truth(
         return None
     
     # CORREZIONE CHIAVE 2: Inizializza risultati con TUTTI i 400 esempi
-    # Ogni esempio ha la sua posizione fissa, anche se LLM fallisce
     results = []
     for i, (text, label) in enumerate(zip(clustered_texts, clustered_labels)):
         results.append({
@@ -463,16 +495,16 @@ def generate_ground_truth(
         })
     
     # Load checkpoint se richiesto
-    start_idx = 0
+    completed_count = 0
     if resume:
         checkpoint = load_checkpoint()
         if checkpoint:
             checkpoint_results = checkpoint.get("results", [])
             
             if len(checkpoint_results) == 400:
-                print(f"[RESUME] Found complete checkpoint with 400 examples")
+                print(f"[RESUME] Found checkpoint with 400 examples")
                 
-                # Verifica se è davvero completo
+                # Conta quelli già completati
                 completed_count = sum(1 for r in checkpoint_results if r.get("success", False))
                 pending_count = 400 - completed_count
                 
@@ -480,7 +512,6 @@ def generate_ground_truth(
                     print(f"[RESUME] All 400 examples already completed, loading existing data...")
                     try:
                         df = pd.DataFrame(checkpoint_results)
-                        # Salva anche CSV se non esiste
                         if not HR_DATASET_CSV.exists():
                             save_to_csv(df)
                         return df
@@ -488,17 +519,15 @@ def generate_ground_truth(
                         print(f"[RESUME] Failed to load checkpoint data: {e}")
                 else:
                     print(f"[RESUME] Resuming: {completed_count} completed, {pending_count} pending")
-                    # Usa i risultati del checkpoint mantenendo l'ordine
                     results = checkpoint_results
-                    start_idx = 0  # Ripartiamo da 0 ma saltiamo quelli già fatti
     
-    # CORREZIONE CHIAVE 3: Processing con mantenimento ordine
+    # CORREZIONE 3: Progress bar funzionante
     print(f"\n[PROCESSING] Processing 400 examples (maintaining exact order)...")
     
-    with tqdm(total=400, desc="HR Generation", leave=True) as pbar:
-        # Aggiorna progress bar per esempi già completati
-        completed_already = sum(1 for r in results if r.get("success", False))
-        pbar.update(completed_already)
+    with tqdm(total=400, desc="HR Generation", leave=True, 
+              initial=completed_count, unit="ex") as pbar:
+        
+        processed_count = 0  # Counter per nuovi processamenti
         
         for idx in range(400):
             # Salta se già completato con successo
@@ -509,13 +538,13 @@ def generate_ground_truth(
                 text = results[idx]["text"]
                 label = results[idx]["label"]
                 
-                # Update progress
+                # Update progress description
                 pbar.set_description(f"HR Gen ({idx + 1}/400)")
                 
                 # Generate HR example
                 hr_example = generate_single_hr_example(client, text, label, idx)
                 
-                # IMPORTANTE: mantieni index e dati originali
+                # Update result
                 results[idx].update({
                     "hr_ranking": hr_example["hr_ranking"],
                     "hr_count": hr_example["hr_count"],
@@ -524,17 +553,23 @@ def generate_ground_truth(
                     "raw_response": hr_example["raw_response"]
                 })
                 
+                # CORREZIONE 4: Update progress bar correttamente
+                processed_count += 1
+                pbar.update(1)
+                
                 # Progress info
                 if hr_example["success"]:
-                    status = f" ({hr_example['hr_count']} words)"
+                    status_msg = f"({hr_example['hr_count']} words)"
                 else:
-                    status = f" (FAILED: {hr_example.get('error', 'unknown')})"
+                    status_msg = f"FAILED: {hr_example.get('error', 'unknown')[:20]}"
                 
-                pbar.set_postfix_str(f"Success: {client.successful_requests}/{client.total_requests}{status}")
-                pbar.update(1 if not results[idx-1].get("success", True) else 0)  # Update solo se nuovo
+                current_completed = sum(1 for r in results if r.get("success", False))
+                success_rate = current_completed / (idx + 1) if idx > 0 else 0
                 
-                # Checkpoint ogni 10 esempi
-                if (idx + 1) % 10 == 0:
+                pbar.set_postfix_str(f"✓{current_completed} ✗{(idx+1)-current_completed} ({success_rate:.1%}) {status_msg}")
+                
+                # CORREZIONE 5: Checkpoint ogni 10 esempi processati (non ogni esempio)
+                if processed_count % 10 == 0:
                     current_completed = sum(1 for r in results if r.get("success", False))
                     checkpoint_data = {
                         "results": results,
@@ -542,9 +577,19 @@ def generate_ground_truth(
                         "total_target": 400,
                         "completed": current_completed,
                         "progress_index": idx + 1,
+                        "processed_this_session": processed_count,
                         "stats": client.get_stats()
                     }
                     save_checkpoint(checkpoint_data)
+                
+                # CORREZIONE 6: ETA più accurato
+                if processed_count > 2:
+                    elapsed = time.time() - start_time
+                    rate = processed_count / elapsed
+                    remaining_to_process = sum(1 for r in results if not r.get("success", False)) - 1
+                    eta_seconds = remaining_to_process / rate if rate > 0 else 0
+                    eta_time = datetime.now() + timedelta(seconds=eta_seconds)
+                    pbar.set_description(f"HR Gen ({idx + 1}/400) ETA: {eta_time.strftime('%H:%M')}")
                 
             except KeyboardInterrupt:
                 print(f"\n[INTERRUPT] Generation interrupted by user")
@@ -556,11 +601,12 @@ def generate_ground_truth(
                 print(f"\n[ERROR] Failed to process example {idx}: {e}")
                 results[idx].update({
                     "success": False,
-                    "error": str(e),
+                    "error": str(e)[:100],
                     "hr_ranking": [],
                     "hr_count": 0,
-                    "raw_response": f"ERROR: {str(e)}"
+                    "raw_response": f"ERROR: {str(e)[:50]}"
                 })
+                processed_count += 1
                 pbar.update(1)
     
     # Final statistics
@@ -574,7 +620,9 @@ def generate_ground_truth(
     print(f"Total time: {total_time / 60:.1f} minutes")
     print(f"Examples processed: 400/400 (EXACT MATCH)")
     print(f"Valid examples: {len(valid_examples)} ({success_rate:.1%})")
-    print(f"Average processing time: {total_time / 400:.1f}s per example")
+    if processed_count > 0:
+        print(f"Average processing time: {total_time / processed_count:.1f}s per NEW example")
+    print(f"Overall success rate: {success_rate:.1%}")
     
     # Client statistics
     client_stats = client.get_stats()
@@ -584,11 +632,19 @@ def generate_ground_truth(
     print(f"  Failed: {client_stats['failed_requests']}")
     print(f"  Success rate: {client_stats['success_rate']:.1%}")
     
-    # CORREZIONE CHIAVE 4: Salva sia CSV che pickle
+    # CORREZIONE 7: Mostra esempi con errori se ce ne sono
+    failed_examples = [ex for ex in results if not ex["success"]]
+    if failed_examples:
+        print(f"\nFailed Examples ({len(failed_examples)}):")
+        for i, ex in enumerate(failed_examples[:3]):  # Mostra solo primi 3
+            print(f"  {i+1}. Index {ex['index']}: {ex['error']}")
+        if len(failed_examples) > 3:
+            print(f"  ... and {len(failed_examples) - 3} more")
+    
+    # CORREZIONE 8: Salva sia CSV che pickle
     try:
         df = pd.DataFrame(results)
         
-        # Verifica che abbiamo esattamente 400 righe
         if len(df) != 400:
             print(f"[ERROR] DataFrame has {len(df)} rows instead of 400")
             return None
@@ -609,7 +665,8 @@ def generate_ground_truth(
             "final_stats": client_stats,
             "success_rate": success_rate,
             "total_time_minutes": total_time / 60,
-            "exact_match": True  # Flag per indicare che sono esattamente i 400 del dataset
+            "exact_match": True,
+            "average_processing_time": total_time / processed_count if processed_count > 0 else 0
         }
         save_checkpoint(final_checkpoint)
         
@@ -635,7 +692,7 @@ def save_to_csv(df: pd.DataFrame):
         print(f"[SAVE] Failed to save CSV: {e}")
 
 # =============================================================================
-# UTILITY FUNCTIONS - FIXED
+# UTILITY FUNCTIONS
 # =============================================================================
 
 def load_ground_truth() -> Optional[pd.DataFrame]:
@@ -803,7 +860,7 @@ def test_api_key_compatibility(api_key: str, model: str = DEFAULT_MODEL) -> bool
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Human Reasoning Ground Truth Generator - FIXED VERSION")
+    print("Human Reasoning Ground Truth Generator - COMPLETE FIXED VERSION")
     print("=" * 60)
     
     # Test con API key di esempio
@@ -841,10 +898,15 @@ if __name__ == "__main__":
                 sample_hr = df[df['hr_count'] > 0].iloc[0]
                 print(f"Sample HR ranking: {sample_hr['hr_ranking']}")
     
-    print("\nHuman Reasoning module (FIXED) ready!")
-    print("\nKEY FIXES:")
+    print("\nHuman Reasoning module (COMPLETE FIXED) ready!")
+    print("\nKEY FIXES IMPLEMENTED:")
     print("- Uses EXACTLY the same 400 examples from dataset.test_df")
     print("- Maintains 1:1 correspondence even with LLM failures")
     print("- Saves both CSV (for reuse) and pickle (for session)")
+    print("- Progress bar works correctly from 0% to 100%")
+    print("- Checkpoint every 10 examples (not every example)")
+    print("- Optimized rate limiting with adaptive intervals")
+    print("- Accurate ETA and better statistics")
+    print("- Shows failed examples for debugging")
     print("- Robust recovery without losing original order")
     print("- Verification system for dataset consistency")
